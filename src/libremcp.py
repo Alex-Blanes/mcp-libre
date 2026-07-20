@@ -7,21 +7,52 @@ and other LibreOffice formats.
 """
 
 import asyncio
+import base64
 import json
+import os
+import platform
+import re
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Generator, List, Optional, Union
 from dataclasses import dataclass
 from datetime import datetime
 
 import httpx
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-# Initialize FastMCP server
-mcp = FastMCP("LibreOffice MCP Server")
+from track_changes import TrackedInsertResult, insert_tracked_text_impl
+
+# Transport is stdio by default (local use from Claude Code on this laptop).
+# Set MCP_TRANSPORT=streamable-http (+ MCP_HOST/MCP_PORT/MCP_ALLOWED_HOSTS) to run
+# as a network server, e.g. inside the Docker container deployed on the NAS.
+_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+_EXTRA_ALLOWED_HOSTS = [h for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h]
+
+mcp = FastMCP(
+    "LibreOffice MCP Server",
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("MCP_PORT", "8765")),
+)
+
+# FastMCP's DNS-rebinding protection only allows localhost by default (and, at
+# least in this mcp version, ends up None instead of that default once host/port
+# are passed explicitly above) — build it ourselves so a remote/Tailscale
+# deployment can be reached at all.
+_default_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+_default_origins = [f"{scheme}://{h}" for h in ["127.0.0.1:*", "localhost:*", "[::1]:*"] for scheme in ("http", "https")]
+mcp.settings.transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=_default_hosts + _EXTRA_ALLOWED_HOSTS,
+    allowed_origins=_default_origins
+    + [f"http://{h}" for h in _EXTRA_ALLOWED_HOSTS]
+    + [f"https://{h}" for h in _EXTRA_ALLOWED_HOSTS],
+)
 
 
 # Data models for structured responses
@@ -51,6 +82,7 @@ class ConversionResult(BaseModel):
     target_format: str = Field(description="Converted format")
     success: bool = Field(description="Whether conversion was successful")
     error_message: Optional[str] = Field(description="Error message if conversion failed")
+    result_base64: Optional[str] = Field(default=None, description="Base64-encoded converted document (base64 mode)")
 
 
 class SpreadsheetData(BaseModel):
@@ -59,6 +91,19 @@ class SpreadsheetData(BaseModel):
     data: List[List[str]] = Field(description="2D array of cell values")
     row_count: int = Field(description="Number of rows")
     col_count: int = Field(description="Number of columns")
+
+
+class DocResult(BaseModel):
+    """Result of a document mutation operation (path or base64 mode)"""
+    success: bool = Field(default=True, description="Whether the operation succeeded")
+    error: Optional[str] = Field(default=None, description="Error message if failed")
+    path: Optional[str] = Field(default=None, description="Path to the document (filesystem mode)")
+    filename: Optional[str] = Field(default=None, description="Document filename")
+    format: Optional[str] = Field(default=None, description="Document format")
+    size_bytes: Optional[int] = Field(default=None, description="File size in bytes")
+    modified_time: Optional[datetime] = Field(default=None, description="Last modification time")
+    exists: Optional[bool] = Field(default=None, description="Whether the file exists")
+    result_base64: Optional[str] = Field(default=None, description="Base64-encoded result document (base64 mode)")
 
 
 # Helper functions
@@ -99,21 +144,95 @@ def _get_document_info(file_path: str) -> DocumentInfo:
     )
 
 
+# Document resolution helpers for base64 support
+_format_extensions = {
+    "writer": ".odt",
+    "calc": ".ods",
+    "spreadsheet": ".ods",
+    "impress": ".odp",
+    "draw": ".odg",
+}
+
+
+_WINDOWS_PATH_RE = re.compile(r'^[A-Za-z]:[/\\]')
+_SERVER_OS = platform.system()
+
+
+def _is_windows_path(p: str) -> bool:
+    return bool(_WINDOWS_PATH_RE.match(str(p)))
+
+
+@contextmanager
+def _resolve_document(
+    path: Optional[str] = None,
+    document_base64: Optional[str] = None,
+    format_hint: str = "writer",
+) -> Generator[str, None, None]:
+    """Resolve a document from either a filesystem path or base64 content.
+
+    If document_base64 is provided, writes it to a temp file and cleans up
+    on exit. If path is provided, validates it exists and yields it directly.
+    """
+    if document_base64 is not None:
+        ext = _format_extensions.get(format_hint, ".odt")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            doc_path = Path(tmp_dir) / f"document{ext}"
+            doc_path.write_bytes(base64.b64decode(document_base64))
+            yield str(doc_path)
+        return
+    if path is not None:
+        normalized = str(path).replace('\\', '/')
+        p = Path(normalized)
+        if not p.exists():
+            if _is_windows_path(path) and _SERVER_OS != "Windows":
+                raise FileNotFoundError(
+                    f"Path '{path}' is a Windows-style path but this MCP server "
+                    f"runs on {_SERVER_OS} (Docker container).\n"
+                    f"Windows filesystem paths are NOT accessible from the server.\n\n"
+                    f"👉 Read your local file first, encode it to base64, and call "
+                    f"this tool with the 'document_base64' parameter instead.\n\n"
+                    f"Example workflow:\n"
+                    f"  1. Read file bytes from your local machine\n"
+                    f"  2. Base64-encode the bytes\n"
+                    f"  3. Pass as: document_base64=<encoded_content>"
+                )
+            raise FileNotFoundError(
+                f"Document not found: {path}. "
+                f"If the file is on your local machine and this is a remote MCP "
+                f"server, pass the file content as 'document_base64' instead of 'path'."
+            )
+        yield normalized
+        return
+    raise ValueError("Either 'path' or 'document_base64' must be provided")
+
+
+def _read_as_base64(path: str) -> str:
+    """Read a file and return its content as a base64-encoded string."""
+    return base64.b64encode(Path(path).read_bytes()).decode("ascii")
+
+
 # Core LibreOffice Tools
 
 @mcp.tool()
-def create_document(path: str, doc_type: str = "writer", content: str = "") -> DocumentInfo:
+def create_document(path: Optional[str] = None, doc_type: str = "writer", content: str = "", return_base64: bool = False) -> DocResult:
     """Create a new LibreOffice document
     
     Args:
-        path: Full path where the document should be created
+        path: Full path where the document should be created (omit for base64 mode)
         doc_type: Type of document to create (writer, calc, impress, draw)
         content: Initial content for the document (for writer documents)
+        return_base64: If True, return the document as base64 instead of writing to disk
     """
-    path_obj = Path(path)
+    # Determine mode
+    use_base64 = return_base64 or not path
     
-    # Ensure directory exists
-    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    if use_base64:
+        _tmp_manager = tempfile.TemporaryDirectory()
+        path_obj = Path(_tmp_manager.name) / f"document{_format_extensions.get(doc_type, '.odt')}"
+    else:
+        _tmp_manager = None
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
     
     # Map document types to LibreOffice formats
     format_map = {
@@ -124,12 +243,11 @@ def create_document(path: str, doc_type: str = "writer", content: str = "") -> D
     }
     
     if doc_type not in format_map:
-        raise ValueError(f"Unsupported document type: {doc_type}. Use: {list(format_map.keys())}")
+        return DocResult(success=False, error=f"Unsupported document type: {doc_type}. Use: {list(format_map.keys())}")
     
     # Add appropriate extension if not present
     if not path_obj.suffix:
-        path = str(path_obj) + format_map[doc_type]
-        path_obj = Path(path)
+        path_obj = path_obj.parent / (path_obj.stem + format_map[doc_type])
     
     try:
         if doc_type == "writer" and content:
@@ -155,25 +273,16 @@ def create_document(path: str, doc_type: str = "writer", content: str = "") -> D
                 if converted_file.exists():
                     converted_file.rename(path_obj)
                 else:
-                    # If conversion failed, create a basic ODT file manually
-                    # This is a minimal ODT structure
                     import zipfile
-                    import xml.etree.ElementTree as ET
                     
-                    # Create a minimal ODT file
                     with zipfile.ZipFile(path_obj, 'w', zipfile.ZIP_DEFLATED) as zf:
-                        # Add mimetype
                         zf.writestr('mimetype', 'application/vnd.oasis.opendocument.text')
-                        
-                        # Add META-INF/manifest.xml
                         manifest = '''<?xml version="1.0" encoding="UTF-8"?>
 <manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0">
  <manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/>
  <manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
 </manifest:manifest>'''
                         zf.writestr('META-INF/manifest.xml', manifest)
-                        
-                        # Add content.xml with the text
                         content_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
  <office:body>
@@ -185,20 +294,9 @@ def create_document(path: str, doc_type: str = "writer", content: str = "") -> D
                         zf.writestr('content.xml', content_xml)
                 
             finally:
-                # Clean up temporary file
                 Path(tmp_path).unlink(missing_ok=True)
         else:
-            # For other document types or empty documents, try LibreOffice template creation
             try:
-                # Try using LibreOffice to create an empty document
-                template_map = {
-                    "writer": "--writer",
-                    "calc": "--calc", 
-                    "impress": "--impress",
-                    "draw": "--draw"
-                }
-                
-                # Create using LibreOffice command line
                 result = _run_libreoffice_command([
                     '--headless',
                     '--invisible',
@@ -208,13 +306,11 @@ def create_document(path: str, doc_type: str = "writer", content: str = "") -> D
                     '--norestore',
                     '--convert-to', format_map[doc_type].lstrip('.'),
                     '--outdir', str(path_obj.parent),
-                    '/dev/null'  # Convert from nothing to create empty document
+                    '/dev/null'
                 ])
                 
-                # If that doesn't work, create minimal file structure
                 if not path_obj.exists():
                     if doc_type == "writer":
-                        # Create minimal ODT
                         import zipfile
                         with zipfile.ZipFile(path_obj, 'w', zipfile.ZIP_DEFLATED) as zf:
                             zf.writestr('mimetype', 'application/vnd.oasis.opendocument.text')
@@ -234,88 +330,84 @@ def create_document(path: str, doc_type: str = "writer", content: str = "") -> D
 </office:document-content>'''
                             zf.writestr('content.xml', content_xml)
                     else:
-                        # For other formats, create empty file
                         path_obj.touch()
                         
-            except Exception as e:
-                # Fallback: create empty file
+            except Exception:
                 path_obj.touch()
         
-        return _get_document_info(str(path_obj))
+        doc_info = _get_document_info(str(path_obj))
+        if use_base64:
+            return DocResult(**doc_info.model_dump(), success=True, result_base64=_read_as_base64(str(path_obj)))
+        return DocResult(**doc_info.model_dump(), success=True)
         
     except Exception as e:
-        raise RuntimeError(f"Failed to create document: {str(e)}")
+        return DocResult(success=False, error=str(e))
+    finally:
+        if _tmp_manager:
+            _tmp_manager.cleanup()
 
 
 @mcp.tool()
-def read_document_text(path: str) -> TextContent:
+def read_document_text(path: Optional[str] = None, document_base64: Optional[str] = None) -> TextContent:
     """Extract text content from a LibreOffice document
     
     Args:
-        path: Path to the document file
+        path: Path to the document file (omit if using document_base64)
+        document_base64: Base64-encoded document content (alternative to path)
     """
-    path_obj = Path(path)
-    if not path_obj.exists():
-        raise FileNotFoundError(f"Document not found: {path}")
-    
     try:
-        # Use LibreOffice to convert to plain text
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            result = _run_libreoffice_command([
-                '--headless',
-                '--convert-to', 'txt',
-                '--outdir', tmp_dir,
-                str(path_obj)
-            ])
+        with _resolve_document(path, document_base64) as resolved_path:
+            path_obj = Path(resolved_path)
             
-            # Debug: check what files were created
-            tmp_path = Path(tmp_dir)
-            created_files = list(tmp_path.iterdir())
-            
-            # Look for the converted text file
-            txt_file = None
-            # Try different possible names
-            possible_names = [
-                path_obj.stem + '.txt',
-                path_obj.name + '.txt', 
-                'output.txt'
-            ]
-            
-            for name in possible_names:
-                candidate = tmp_path / name
-                if candidate.exists():
-                    txt_file = candidate
-                    break
-            
-            # If no specific file found, try any .txt file
-            if not txt_file:
-                txt_files = list(tmp_path.glob('*.txt'))
-                if txt_files:
-                    txt_file = txt_files[0]
-            
-            if txt_file and txt_file.exists():
-                content = txt_file.read_text(encoding='utf-8', errors='ignore')
-            else:
-                # Fallback: try to extract text directly from ODT if it's a zip file
-                if path_obj.suffix.lower() == '.odt':
-                    content = _extract_text_from_odt(str(path_obj))
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                result = _run_libreoffice_command([
+                    '--headless',
+                    '--convert-to', 'txt',
+                    '--outdir', tmp_dir,
+                    str(path_obj)
+                ])
+                
+                tmp_path = Path(tmp_dir)
+                created_files = list(tmp_path.iterdir())
+                
+                txt_file = None
+                possible_names = [
+                    path_obj.stem + '.txt',
+                    path_obj.name + '.txt', 
+                    'output.txt'
+                ]
+                
+                for name in possible_names:
+                    candidate = tmp_path / name
+                    if candidate.exists():
+                        txt_file = candidate
+                        break
+                
+                if not txt_file:
+                    txt_files = list(tmp_path.glob('*.txt'))
+                    if txt_files:
+                        txt_file = txt_files[0]
+                
+                if txt_file and txt_file.exists():
+                    content = txt_file.read_text(encoding='utf-8', errors='ignore')
                 else:
-                    # Last resort: read as plain text
-                    try:
-                        content = path_obj.read_text(encoding='utf-8', errors='ignore')
-                    except:
-                        raise RuntimeError(f"Could not extract text. LibreOffice output: {result.stderr}. Files created: {[f.name for f in created_files]}")
-        
-        word_count = len(content.split())
-        char_count = len(content)
-        
-        return TextContent(
-            content=content,
-            word_count=word_count,
-            char_count=char_count,
-            page_count=None  # Page count would require more complex parsing
-        )
-        
+                    if path_obj.suffix.lower() == '.odt':
+                        content = _extract_text_from_odt(str(path_obj))
+                    else:
+                        try:
+                            content = path_obj.read_text(encoding='utf-8', errors='ignore')
+                        except:
+                            raise RuntimeError(f"Could not extract text. LibreOffice output: {result.stderr}. Files created: {[f.name for f in created_files]}")
+            
+            word_count = len(content.split())
+            char_count = len(content)
+            
+            return TextContent(
+                content=content,
+                word_count=word_count,
+                char_count=char_count,
+                page_count=None
+            )
     except Exception as e:
         raise RuntimeError(f"Failed to read document: {str(e)}")
 
@@ -348,62 +440,83 @@ def _extract_text_from_odt(file_path: str) -> str:
 
 
 @mcp.tool()
-def convert_document(source_path: str, target_path: str, target_format: str) -> ConversionResult:
+def convert_document(
+    source_path: Optional[str] = None,
+    target_path: Optional[str] = None,
+    target_format: str = "pdf",
+    document_base64: Optional[str] = None,
+    return_base64: bool = False,
+) -> ConversionResult:
     """Convert a document to a different format
     
     Args:
-        source_path: Path to the source document
-        target_path: Path where converted document should be saved
+        source_path: Path to the source document (omit if using document_base64)
+        target_path: Path where converted document should be saved (omit for base64 output)
         target_format: Target format (pdf, docx, xlsx, pptx, html, txt, etc.)
+        document_base64: Base64-encoded source document (alternative to source_path)
+        return_base64: If True, return the converted document as base64
     """
-    source_obj = Path(source_path)
-    target_obj = Path(target_path)
-    
-    if not source_obj.exists():
-        return ConversionResult(
-            source_path=source_path,
-            target_path=target_path,
-            source_format=source_obj.suffix.lower().lstrip('.'),
-            target_format=target_format,
-            success=False,
-            error_message=f"Source file not found: {source_path}"
-        )
-    
-    # Ensure target directory exists
-    target_obj.parent.mkdir(parents=True, exist_ok=True)
+    use_base64_input = document_base64 is not None
+    use_base64_output = return_base64 or (use_base64_input and not target_path)
     
     try:
-        result = _run_libreoffice_command([
-            '--headless',
-            '--convert-to', target_format,
-            '--outdir', str(target_obj.parent),
-            str(source_obj)
-        ])
-        
-        # LibreOffice creates the file with a predictable name
-        expected_output = target_obj.parent / (source_obj.stem + f'.{target_format}')
-        
-        # Move to target location if needed
-        if expected_output.exists() and expected_output != target_obj:
-            expected_output.rename(target_obj)
-        
-        success = target_obj.exists()
-        error_msg = None if success else f"Conversion failed. LibreOffice output: {result.stderr}"
-        
+        with _resolve_document(source_path, document_base64) as resolved_source:
+            source_obj = Path(resolved_source)
+            
+            if use_base64_output:
+                _tmp_manager = tempfile.TemporaryDirectory()
+                resolved_target = Path(_tmp_manager.name) / f"output.{target_format}"
+            else:
+                _tmp_manager = None
+                resolved_target = Path(target_path)
+                resolved_target.parent.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                result = _run_libreoffice_command([
+                    '--headless',
+                    '--convert-to', target_format,
+                    '--outdir', str(resolved_target.parent),
+                    str(source_obj)
+                ])
+                
+                expected_output = resolved_target.parent / (source_obj.stem + f'.{target_format}')
+                if expected_output.exists() and expected_output != resolved_target:
+                    expected_output.rename(resolved_target)
+                
+                success = resolved_target.exists()
+                error_msg = None if success else f"Conversion failed. LibreOffice output: {result.stderr}"
+                
+                conv_result = ConversionResult(
+                    source_path=str(source_obj) if use_base64_input else (source_path or str(source_obj)),
+                    target_path=str(resolved_target),
+                    source_format=source_obj.suffix.lower().lstrip('.'),
+                    target_format=target_format,
+                    success=success,
+                    error_message=error_msg,
+                )
+                
+                if success and use_base64_output:
+                    conv_result.result_base64 = _read_as_base64(str(resolved_target))
+                
+                return conv_result
+                
+            except Exception as e:
+                return ConversionResult(
+                    source_path=str(source_obj) if use_base64_input else (source_path or str(source_obj)),
+                    target_path=str(resolved_target),
+                    source_format=source_obj.suffix.lower().lstrip('.'),
+                    target_format=target_format,
+                    success=False,
+                    error_message=str(e)
+                )
+            finally:
+                if _tmp_manager:
+                    _tmp_manager.cleanup()
+    except FileNotFoundError as e:
         return ConversionResult(
-            source_path=source_path,
-            target_path=str(target_obj),
-            source_format=source_obj.suffix.lower().lstrip('.'),
-            target_format=target_format,
-            success=success,
-            error_message=error_msg
-        )
-        
-    except Exception as e:
-        return ConversionResult(
-            source_path=source_path,
-            target_path=target_path,
-            source_format=source_obj.suffix.lower().lstrip('.'),
+            source_path=source_path or "(base64)",
+            target_path=target_path or "(base64)",
+            source_format="",
             target_format=target_format,
             success=False,
             error_message=str(e)
@@ -411,187 +524,132 @@ def convert_document(source_path: str, target_path: str, target_format: str) -> 
 
 
 @mcp.tool()
-def get_document_info(path: str) -> DocumentInfo:
+def get_document_info(path: Optional[str] = None, document_base64: Optional[str] = None) -> DocumentInfo:
     """Get detailed information about a LibreOffice document
     
     Args:
-        path: Path to the document file
+        path: Path to the document file (omit if using document_base64)
+        document_base64: Base64-encoded document content (alternative to path)
     """
-    return _get_document_info(path)
+    with _resolve_document(path, document_base64) as resolved_path:
+        return _get_document_info(resolved_path)
 
 
 @mcp.tool()
-def read_spreadsheet_data(path: str, sheet_name: Optional[str] = None, max_rows: int = 100) -> SpreadsheetData:
+def read_spreadsheet_data(path: Optional[str] = None, document_base64: Optional[str] = None, sheet_name: Optional[str] = None, max_rows: int = 100) -> SpreadsheetData:
     """Read data from a LibreOffice Calc spreadsheet
     
     Args:
-        path: Path to the spreadsheet file (.ods, .xlsx, etc.)
+        path: Path to the spreadsheet file (.ods, .xlsx, etc.; omit if using document_base64)
+        document_base64: Base64-encoded spreadsheet content (alternative to path)
         sheet_name: Name of the specific sheet to read (if None, reads first sheet)
         max_rows: Maximum number of rows to read (default 100)
     """
-    path_obj = Path(path)
-    if not path_obj.exists():
-        raise FileNotFoundError(f"Spreadsheet not found: {path}")
-    
     try:
-        # Convert to CSV to easily read the data
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            result = _run_libreoffice_command([
-                '--headless',
-                '--convert-to', 'csv',
-                '--outdir', tmp_dir,
-                str(path_obj)
-            ])
+        with _resolve_document(path, document_base64, format_hint="spreadsheet") as resolved_path:
+            path_obj = Path(resolved_path)
             
-            csv_file = Path(tmp_dir) / (path_obj.stem + '.csv')
-            if not csv_file.exists():
-                raise RuntimeError("Failed to convert spreadsheet to CSV")
-            
-            # Read CSV data
-            import csv
-            data = []
-            with open(csv_file, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                for i, row in enumerate(reader):
-                    if i >= max_rows:
-                        break
-                    data.append(row)
-            
-            row_count = len(data)
-            col_count = max(len(row) for row in data) if data else 0
-            
-            return SpreadsheetData(
-                sheet_name=sheet_name or "Sheet1",
-                data=data,
-                row_count=row_count,
-                col_count=col_count
-            )
-            
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                result = _run_libreoffice_command([
+                    '--headless',
+                    '--convert-to', 'csv',
+                    '--outdir', tmp_dir,
+                    str(path_obj)
+                ])
+                
+                csv_file = Path(tmp_dir) / (path_obj.stem + '.csv')
+                if not csv_file.exists():
+                    raise RuntimeError("Failed to convert spreadsheet to CSV")
+                
+                import csv
+                data = []
+                with open(csv_file, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    for i, row in enumerate(reader):
+                        if i >= max_rows:
+                            break
+                        data.append(row)
+                
+                row_count = len(data)
+                col_count = max(len(row) for row in data) if data else 0
+                
+                return SpreadsheetData(
+                    sheet_name=sheet_name or "Sheet1",
+                    data=data,
+                    row_count=row_count,
+                    col_count=col_count
+                )
     except Exception as e:
         raise RuntimeError(f"Failed to read spreadsheet: {str(e)}")
 
 
 @mcp.tool()
-def insert_text_at_position(path: str, text: str, position: str = "end") -> DocumentInfo:
+def insert_text_at_position(
+    path: Optional[str] = None,
+    text: str = "",
+    position: str = "end",
+    document_base64: Optional[str] = None,
+    return_base64: bool = False,
+) -> DocResult:
     """Insert text into a LibreOffice Writer document
     
     Args:
-        path: Path to the document file
+        path: Path to the document file (omit if using document_base64)
         text: Text to insert
         position: Where to insert the text ("start", "end", or "replace")
+        document_base64: Base64-encoded document content (alternative to path)
+        return_base64: If True, return the modified document as base64
     """
-    path_obj = Path(path)
-    if not path_obj.exists():
-        raise FileNotFoundError(f"Document not found: {path}")
+    use_base64 = return_base64 or (document_base64 is not None and not path)
     
     try:
-        # Read existing content
-        existing_content = read_document_text(path).content
-        
-        # Determine new content based on position
-        if position == "start":
-            new_content = text + "\n" + existing_content
-        elif position == "end":
-            new_content = existing_content + "\n" + text
-        elif position == "replace":
-            new_content = text
-        else:
-            raise ValueError("Position must be 'start', 'end', or 'replace'")
-        
-        # Get file extension to determine document type
-        file_ext = path_obj.suffix.lower()
-        
-        # Create backup
-        backup_path = str(path_obj) + '.backup'
-        import shutil
-        shutil.copy2(path_obj, backup_path)
-        
-        try:
-            if file_ext in ['.odt', '.docx', '.doc']:
-                # For Writer documents, use a more robust approach
-                success = _insert_text_writer_document(str(path_obj), new_content)
-                if not success:
-                    # Fallback: recreate document with new content
-                    _recreate_writer_document(str(path_obj), new_content)
+        with _resolve_document(path, document_base64) as resolved_path:
+            path_obj = Path(resolved_path)
+            existing_content = read_document_text(path=resolved_path).content
+            
+            if position == "start":
+                new_content = text + "\n" + existing_content
+            elif position == "end":
+                new_content = existing_content + "\n" + text
+            elif position == "replace":
+                new_content = text
             else:
-                # For other formats, try to recreate
-                _recreate_document_with_content(str(path_obj), new_content)
-                
-        except Exception as convert_error:
-            # Restore backup if anything goes wrong
-            shutil.copy2(backup_path, path_obj)
-            raise RuntimeError(f"Failed to modify document: {str(convert_error)}")
-        finally:
-            # Clean up backup
-            Path(backup_path).unlink(missing_ok=True)
-        
-        return _get_document_info(str(path_obj))
-        
+                return DocResult(success=False, error="Position must be 'start', 'end', or 'replace'")
+            
+            file_ext = path_obj.suffix.lower()
+            
+            import shutil
+            backup_path = str(path_obj) + '.backup'
+            shutil.copy2(path_obj, backup_path)
+            
+            try:
+                if file_ext in ['.odt', '.docx', '.doc']:
+                    success = _insert_text_writer_document(str(path_obj), new_content)
+                    if not success:
+                        _recreate_writer_document(str(path_obj), new_content)
+                else:
+                    _recreate_document_with_content(str(path_obj), new_content)
+            except Exception as convert_error:
+                shutil.copy2(backup_path, path_obj)
+                return DocResult(success=False, error=f"Failed to modify document: {str(convert_error)}")
+            finally:
+                Path(backup_path).unlink(missing_ok=True)
+            
+            doc_info = _get_document_info(str(path_obj))
+            if use_base64:
+                return DocResult(**doc_info.model_dump(), success=True, result_base64=_read_as_base64(str(path_obj)))
+            return DocResult(**doc_info.model_dump(), success=True)
     except Exception as e:
-        raise RuntimeError(f"Failed to insert text: {str(e)}")
+        return DocResult(success=False, error=str(e))
 
 
 def _insert_text_writer_document(path: str, content: str) -> bool:
-    """Insert text into Writer document using LibreOffice macro approach"""
-    try:
-        # Create a temporary script file for LibreOffice macro
-        script_content = f'''
-import uno
-import sys
+    """Insert text into Writer document using LibreOffice macro approach
 
-def modify_document():
-    try:
-        # Connect to LibreOffice
-        local_context = uno.getComponentContext()
-        resolver = local_context.ServiceManager.createInstanceWithContext(
-            "com.sun.star.bridge.UnoUrlResolver", local_context)
-        
-        # Start LibreOffice if not running
-        import subprocess
-        subprocess.Popen([
-            "libreoffice", "--headless", "--accept=socket,host=127.0.0.1,port=2002;urp;"
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        import time
-        time.sleep(2)  # Wait for LibreOffice to start
-        
-        ctx = resolver.resolve("uno:socket,host=127.0.0.1,port=2002;urp;StarOffice.ComponentContext")
-        smgr = ctx.ServiceManager
-        desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
-        
-        # Open document
-        doc = desktop.loadComponentFromURL("file://{path}", "_blank", 0, ())
-        
-        # Clear content and insert new content
-        text = doc.getText()
-        text.setString("{content.replace('"', '\\"')}")
-        
-        # Save document
-        doc.store()
-        doc.close(True)
-        
-        return True
-    except:
-        return False
-
-if __name__ == "__main__":
-    modify_document()
-'''
-        
-        # Try the macro approach (advanced)
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as script:
-            script.write(script_content)
-            script_path = script.name
-        
-        try:
-            # This is complex and may not work in all environments
-            # So we'll skip it and use the simpler approach
-            return False
-        finally:
-            Path(script_path).unlink(missing_ok=True)
-            
-    except Exception:
-        return False
+    Unimplemented: always falls back to _recreate_writer_document. Real tracked
+    insertion is handled separately by insert_tracked_text (see track_changes.py).
+    """
+    return False
 
 
 def _recreate_writer_document(path: str, content: str):
@@ -735,6 +793,42 @@ def _recreate_document_with_content(path: str, content: str):
         f.write(content)
 
 
+@mcp.tool()
+def insert_tracked_text(
+    document_base64: str,
+    anchor_text: str,
+    new_text: str,
+    author: Optional[str] = None,
+    insert_mode: str = "after",
+) -> TrackedInsertResult:
+    """Insert text into an .odt document as a tracked change (control de cambios)
+
+    Stateless: takes the source .odt as a base64 blob and returns the modified
+    .odt as a base64 blob — it never touches the caller's filesystem or any
+    remote storage (Nextcloud, etc). The caller reads the source file, passes
+    its bytes here, and writes the returned bytes back wherever they came from.
+
+    Unlike insert_text_at_position, this does NOT rewrite the document content.
+    It opens the document via LibreOffice's UNO API, enables RecordChanges,
+    finds anchor_text, and inserts new_text next to it so it shows up as a
+    reviewable insertion (Editar > Seguimiento de cambios > Gestionar).
+
+    Args:
+        document_base64: Base64-encoded content of the source .odt file
+        anchor_text: Existing text used to locate the insertion point
+        new_text: Text to insert as a tracked insertion
+        author: "Nombre Apellido" to attribute the change to (optional)
+        insert_mode: "after" (default) or "before" the anchor text
+    """
+    return insert_tracked_text_impl(
+        document_base64=document_base64,
+        anchor_text=anchor_text,
+        new_text=new_text,
+        author=author,
+        insert_mode=insert_mode,
+    )
+
+
 # Resources for document discovery
 
 @mcp.resource("documents://")
@@ -783,14 +877,32 @@ def get_document_content(path: str) -> str:
 # Additional utility tools
 
 @mcp.tool()
-def search_documents(query: str, search_path: Optional[str] = None) -> List[Dict[str, Any]]:
+def search_documents(query: str, search_path: Optional[str] = None, documents_base64: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Search for documents containing specific text
     
     Args:
         query: Text to search for
         search_path: Directory to search in (default: common document locations)
+        documents_base64: List of base64-encoded documents to search (alternative to filesystem search)
     """
     results = []
+    
+    if documents_base64:
+        for idx, doc_b64 in enumerate(documents_base64):
+            try:
+                with _resolve_document(document_base64=doc_b64) as resolved_path:
+                    content = read_document_text(path=resolved_path)
+                    if query.lower() in content.content.lower():
+                        results.append({
+                            "path": f"(base64:{idx})",
+                            "filename": f"document_{idx}.odt",
+                            "format": ".odt",
+                            "word_count": content.word_count,
+                            "match_context": _get_match_context(content.content, query)
+                        })
+            except Exception:
+                continue
+        return results
     
     if search_path:
         search_paths = [Path(search_path)]
@@ -813,10 +925,7 @@ def search_documents(query: str, search_path: Optional[str] = None) -> List[Dict
                     continue
                     
                 try:
-                    # Read document content
                     content = read_document_text(str(doc_path))
-                    
-                    # Search for query in content (case-insensitive)
                     if query.lower() in content.content.lower():
                         results.append({
                             "path": str(doc_path),
@@ -825,9 +934,7 @@ def search_documents(query: str, search_path: Optional[str] = None) -> List[Dict
                             "word_count": content.word_count,
                             "match_context": _get_match_context(content.content, query)
                         })
-                        
                 except Exception:
-                    # Skip documents that can't be read
                     continue
     
     return results
@@ -889,69 +996,141 @@ def batch_convert_documents(source_dir: str, target_dir: str, target_format: str
 
 
 @mcp.tool()
-def merge_text_documents(document_paths: List[str], output_path: str, 
-                        separator: str = "\n\n---\n\n") -> DocumentInfo:
+def merge_text_documents(
+    document_paths: Optional[List[str]] = None,
+    output_path: Optional[str] = None,
+    separator: str = "\n\n---\n\n",
+    documents_base64: Optional[List[str]] = None,
+    return_base64: bool = False,
+) -> DocResult:
     """Merge multiple text documents into a single document
     
     Args:
-        document_paths: List of paths to documents to merge
-        output_path: Path where merged document should be saved
+        document_paths: List of paths to documents to merge (omit if using documents_base64)
+        output_path: Path where merged document should be saved (omit for base64 output)
         separator: Text to insert between merged documents
+        documents_base64: List of base64-encoded documents to merge (alternative to document_paths)
+        return_base64: If True, return the merged document as base64
     """
+    use_base64 = return_base64 or (documents_base64 is not None and not output_path)
     merged_content = []
     
-    for doc_path in document_paths:
-        try:
-            content = read_document_text(doc_path)
-            doc_name = Path(doc_path).name
-            merged_content.append(f"=== {doc_name} ===\n\n{content.content}")
-        except Exception as e:
-            merged_content.append(f"=== {Path(doc_path).name} ===\n\nError reading document: {str(e)}")
+    if documents_base64:
+        for idx, doc_b64 in enumerate(documents_base64):
+            try:
+                with _resolve_document(document_base64=doc_b64) as resolved_path:
+                    content = read_document_text(path=resolved_path)
+                    merged_content.append(f"=== document_{idx}.odt ===\n\n{content.content}")
+            except Exception as e:
+                merged_content.append(f"=== document_{idx}.odt ===\n\nError reading document: {str(e)}")
+    else:
+        paths = document_paths or []
+        for doc_path in paths:
+            try:
+                content = read_document_text(doc_path)
+                doc_name = Path(doc_path).name
+                merged_content.append(f"=== {doc_name} ===\n\n{content.content}")
+            except Exception as e:
+                merged_content.append(f"=== {Path(doc_path).name} ===\n\nError reading document: {str(e)}")
     
     final_content = separator.join(merged_content)
     
-    # Create the merged document
-    return create_document(output_path, "writer", final_content)
+    if use_base64:
+        return create_document(doc_type="writer", content=final_content, return_base64=True)
+    return create_document(path=output_path or "merged.odt", doc_type="writer", content=final_content)
 
 
 @mcp.tool()
-def get_document_statistics(path: str) -> Dict[str, Any]:
+def get_document_statistics(path: Optional[str] = None, document_base64: Optional[str] = None) -> Dict[str, Any]:
     """Get detailed statistics about a document
     
     Args:
-        path: Path to the document file
+        path: Path to the document file (omit if using document_base64)
+        document_base64: Base64-encoded document content (alternative to path)
     """
-    doc_info = get_document_info(path)
-    
-    if not doc_info.exists:
-        raise FileNotFoundError(f"Document not found: {path}")
-    
-    try:
-        content = read_document_text(path)
+    with _resolve_document(path, document_base64) as resolved_path:
+        doc_info = get_document_info(path=resolved_path)
         
-        # Calculate additional statistics
-        lines = content.content.split('\n')
-        paragraphs = [p for p in content.content.split('\n\n') if p.strip()]
-        sentences = [s for s in content.content.replace('!', '.').replace('?', '.').split('.') if s.strip()]
-        
-        return {
-            "file_info": doc_info.model_dump(),
-            "content_stats": {
-                "word_count": content.word_count,
-                "character_count": content.char_count,
-                "line_count": len(lines),
-                "paragraph_count": len(paragraphs),
-                "sentence_count": len(sentences),
-                "average_words_per_sentence": content.word_count / max(len(sentences), 1),
-                "average_chars_per_word": content.char_count / max(content.word_count, 1)
+        try:
+            content = read_document_text(path=resolved_path)
+            
+            lines = content.content.split('\n')
+            paragraphs = [p for p in content.content.split('\n\n') if p.strip()]
+            sentences = [s for s in content.content.replace('!', '.').replace('?', '.').split('.') if s.strip()]
+            
+            return {
+                "file_info": doc_info.model_dump(),
+                "content_stats": {
+                    "word_count": content.word_count,
+                    "character_count": content.char_count,
+                    "line_count": len(lines),
+                    "paragraph_count": len(paragraphs),
+                    "sentence_count": len(sentences),
+                    "average_words_per_sentence": content.word_count / max(len(sentences), 1),
+                    "average_chars_per_word": content.char_count / max(content.word_count, 1)
+                }
             }
-        }
-        
-    except Exception as e:
-        return {
-            "file_info": doc_info.model_dump(),
-            "error": f"Could not analyze content: {str(e)}"
-        }
+            
+        except Exception as e:
+            return {
+                "file_info": doc_info.model_dump(),
+                "error": f"Could not analyze content: {str(e)}"
+            }
+
+
+@mcp.tool()
+def get_server_info() -> Dict[str, Any]:
+    """Get information about the LibreOffice MCP server environment.
+
+    Returns platform, LibreOffice version, accessible paths, and operational
+    hints. Useful for debugging connection issues and understanding what
+    the server can access.
+    """
+    info: Dict[str, Any] = {
+        "platform": platform.system(),
+        "platform_release": platform.release(),
+        "python_version": platform.python_version(),
+        "in_docker": os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv'),
+        "transport_mode": _TRANSPORT,
+        "hostname": platform.node(),
+        "temp_directory": tempfile.gettempdir(),
+        "libreoffice_version": None,
+        "hints": [],
+    }
+
+    try:
+        result = subprocess.run(
+            ['libreoffice', '--version'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            info["libreoffice_version"] = result.stdout.strip()
+    except Exception:
+        pass
+
+    server_is_linux = info["platform"] == "Linux"
+    if server_is_linux:
+        info["hints"].append(
+            "Server runs on Linux. Windows paths (C:\\...) are NOT accessible "
+            "from this server. Always use 'document_base64' parameter to send "
+            "document content when the file is on your local Windows machine."
+        )
+
+    if info["in_docker"]:
+        info["hints"].append(
+            "Server runs inside a Docker container. The container filesystem "
+            "is isolated from the host. Read documents locally and pass them "
+            "via 'document_base64'."
+        )
+
+    info["hints"].append(
+        "All tools support 'document_base64' as an alternative to filesystem "
+        "paths. When you get 'Document not found' errors, switch to "
+        "document_base64 mode: read the file locally → encode to base64 → "
+        "pass as document_base64=<encoded>."
+    )
+
+    return info
 
 
 # Main server entry point
@@ -983,6 +1162,11 @@ def main():
             print("  It reads JSON-RPC messages from stdin and writes responses to stdout.")
             print("  Use with MCP clients like Claude Desktop or test with test_client.py")
             print("")
+            print("Base64 Support:")
+            print("  All document tools accept document_base64 / documents_base64 params")
+            print("  for stateless remote operation (e.g. via Docker on NAS).")
+            print("  Use return_base64=True to get modified documents as base64.")
+            print("")
             print("Testing:")
             print("  cd tests/ && python test_client.py  # Interactive test client")
             return
@@ -993,13 +1177,15 @@ def main():
     
     # Normal server mode - show startup message and run
     print("🚀 Starting LibreOffice MCP Server...", file=sys.stderr)
-    print("📡 Running in MCP protocol mode (stdio)", file=sys.stderr)
+    print(f"📡 Running in MCP protocol mode ({_TRANSPORT})", file=sys.stderr)
+    if _TRANSPORT != "stdio":
+        print(f"🌐 Listening on {mcp.settings.host}:{mcp.settings.port}", file=sys.stderr)
     print("💡 Use --help for command line options", file=sys.stderr)
     print("🔌 Connect via MCP clients or test with: cd tests/ && python test_client.py", file=sys.stderr)
     print("", file=sys.stderr)
-    
+
     try:
-        mcp.run()
+        mcp.run(transport=_TRANSPORT)
     except KeyboardInterrupt:
         print("\n👋 LibreOffice MCP Server stopped", file=sys.stderr)
     except Exception as e:
@@ -1012,36 +1198,65 @@ async def test_server():
     print("Testing LibreOffice MCP Server...")
     print("=" * 50)
     
-    # First test LibreOffice installation
     if not await test_libreoffice_installation():
         print("❌ LibreOffice installation test failed")
         return
     
-    # Test creating a document
     test_doc = "/tmp/test_document.odt"
+    pdf_path = "/tmp/test_document.pdf"
     try:
-        print("\nTesting document creation...")
-        result = create_document(test_doc, "writer", "This is a test document.\n\nHello, LibreOffice!")
-        print(f"✓ Created test document: {result.filename}")
+        # Test path-based creation
+        print("\nTesting path-based document creation...")
+        result = create_document(test_doc, "writer", "Hello from LibreOffice MCP!")
+        print(f"✓ Created: {result.filename} ({result.size_bytes} bytes)")
         
-        # Test reading the document
-        print("Testing document reading...")
-        content = read_document_text(test_doc)
-        print(f"✓ Read document content: {content.word_count} words")
+        # Test reading via path
+        print("Testing path-based document reading...")
+        content = read_document_text(path=test_doc)
+        print(f"✓ Read: {content.word_count} words, {content.char_count} chars")
         
-        # Test converting to PDF
-        print("Testing document conversion...")
-        pdf_path = "/tmp/test_document.pdf"
-        conversion = convert_document(test_doc, pdf_path, "pdf")
-        if conversion.success:
-            print(f"✓ Conversion to PDF: Success")
-        else:
-            print(f"⚠ Conversion to PDF: Failed - {conversion.error_message}")
+        # Test path-based conversion
+        print("Testing path-based document conversion...")
+        conversion = convert_document(source_path=test_doc, target_path=pdf_path, target_format="pdf")
+        print(f"✓ Converted to PDF: {conversion.success}")
         
-        # Test document statistics
-        print("Testing document statistics...")
-        stats = get_document_statistics(test_doc)
-        print(f"✓ Document statistics: {stats['content_stats']['word_count']} words, {stats['content_stats']['sentence_count']} sentences")
+        # Test path-based statistics
+        print("Testing path-based document statistics...")
+        stats = get_document_statistics(path=test_doc)
+        print(f"✓ Statistics: {stats['content_stats']['word_count']} words")
+        
+        # Test base64 round-trip
+        print("\nTesting base64 round-trip...")
+        with open(test_doc, "rb") as f:
+            doc_b64 = base64.b64encode(f.read()).decode("ascii")
+        
+        content_b64 = read_document_text(document_base64=doc_b64)
+        print(f"✓ Base64 read: {content_b64.word_count} words")
+        
+        stats_b64 = get_document_statistics(document_base64=doc_b64)
+        print(f"✓ Base64 stats: {stats_b64['content_stats']['word_count']} words")
+        
+        # Test insert text via base64
+        print("Testing base64 text insertion...")
+        insert_result = insert_text_at_position(document_base64=doc_b64, text="\n\nInserted via base64!", position="end", return_base64=True)
+        if insert_result.success:
+            doc_b64 = insert_result.result_base64
+            content_after = read_document_text(document_base64=doc_b64)
+            print(f"✓ After base64 insert: {content_after.word_count} words")
+        
+        # Test base64 conversion
+        print("Testing base64 document conversion...")
+        conv_b64 = convert_document(document_base64=doc_b64, target_format="txt", return_base64=True)
+        if conv_b64.success and conv_b64.result_base64:
+            txt_content = base64.b64decode(conv_b64.result_base64).decode("utf-8", errors="ignore")
+            print(f"✓ Base64 conversion: {len(txt_content)} chars")
+        
+        # Test base64 document creation
+        print("Testing base64 document creation...")
+        created = create_document(doc_type="writer", content="Created via base64 mode!", return_base64=True)
+        if created.success and created.result_base64:
+            verify = read_document_text(document_base64=created.result_base64)
+            print(f"✓ Base64 create + read: {verify.word_count} words - '{verify.content.strip()}'")
         
         print("\n✅ All tests passed!")
         
@@ -1051,8 +1266,7 @@ async def test_server():
         traceback.print_exc()
     
     finally:
-        # Clean up test files
-        for test_file in [test_doc, "/tmp/test_document.pdf"]:
+        for test_file in [test_doc, pdf_path]:
             try:
                 Path(test_file).unlink(missing_ok=True)
             except:

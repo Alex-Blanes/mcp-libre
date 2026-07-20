@@ -106,18 +106,70 @@ async def test_mcp_client():
         except Exception as e:
             print(f"   ⚠ Conversion test failed: {str(e)}")
         
+        # Test base64 round-trip operations
+        print("\n🔁 Testing base64 round-trip operations...")
+        try:
+            # Convert test doc to base64
+            import base64
+            with open("/tmp/mcp_test_doc.odt", "rb") as f:
+                doc_b64 = base64.b64encode(f.read()).decode("ascii")
+            
+            # Read via base64
+            result = await client.call_tool("read_document_text", {
+                "document_base64": doc_b64
+            })
+            if result.structuredContent:
+                print(f"   ✓ Base64 read: {result.structuredContent['word_count']} words")
+            
+            # Insert text via base64
+            result = await client.call_tool("insert_text_at_position", {
+                "document_base64": doc_b64,
+                "text": "\n\nInserted via base64 mode!",
+                "position": "end",
+                "return_base64": True
+            })
+            if result.structuredContent and result.structuredContent.get('success'):
+                print(f"   ✓ Base64 insert: 'result_base64' present = {'result_base64' in result.structuredContent}")
+                doc_b64 = result.structuredContent['result_base64']
+            
+            # Convert via base64
+            result = await client.call_tool("convert_document", {
+                "document_base64": doc_b64,
+                "target_format": "txt",
+                "return_base64": True
+            })
+            if result.structuredContent and result.structuredContent.get('success'):
+                txt = base64.b64decode(result.structuredContent['result_base64']).decode('utf-8', errors='ignore')
+                print(f"   ✓ Base64 convert to TXT: {len(txt)} chars")
+            
+            # Create document via base64
+            result = await client.call_tool("create_document", {
+                "doc_type": "writer",
+                "content": "Document created in base64 mode!",
+                "return_base64": True
+            })
+            if result.structuredContent and result.structuredContent.get('success'):
+                print(f"   ✓ Base64 create: got {len(result.structuredContent.get('result_base64', ''))} base64 chars")
+            
+            # Statistics via base64
+            result = await client.call_tool("get_document_statistics", {
+                "document_base64": doc_b64
+            })
+            if result.structuredContent and 'content_stats' in result.structuredContent:
+                print(f"   ✓ Base64 stats: {result.structuredContent['content_stats']['word_count']} words")
+            
+        except Exception as e:
+            print(f"   ⚠ Base64 test failed: {str(e)}")
+        
         # Test resource access
         print("\n📂 Testing resource access...")
         try:
-            # Try to read the document resource with correct URI format
             from pydantic import AnyUrl
             resource_uri = AnyUrl("document://tmp/mcp_test_doc.odt")
             resource_result = await client.read_resource(resource_uri)
             if resource_result.contents:
                 content = resource_result.contents[0]
-                # Import proper content types
                 from mcp.types import TextResourceContents
-                # Check content type and access accordingly
                 if isinstance(content, TextResourceContents):
                     print(f"   ✓ Resource text content preview: {content.text[:100]}...")
                 else:
