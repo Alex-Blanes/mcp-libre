@@ -28,9 +28,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from track_changes import TrackedInsertResult, insert_tracked_text_impl
 
-# Transport is stdio by default (local use from Claude Code on this laptop).
+# Transport is stdio by default (local use).
 # Set MCP_TRANSPORT=streamable-http (+ MCP_HOST/MCP_PORT/MCP_ALLOWED_HOSTS) to run
-# as a network server, e.g. inside the Docker container deployed on the NAS.
+# as a network server, e.g. inside a Docker container.
 _TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 _EXTRA_ALLOWED_HOSTS = [h for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h]
 
@@ -42,8 +42,8 @@ mcp = FastMCP(
 
 # FastMCP's DNS-rebinding protection only allows localhost by default (and, at
 # least in this mcp version, ends up None instead of that default once host/port
-# are passed explicitly above) — build it ourselves so a remote/Tailscale
-# deployment can be reached at all.
+# are passed explicitly above) — build it ourselves so a remote deployment
+# can be reached at all.
 _default_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
 _default_origins = [f"{scheme}://{h}" for h in ["127.0.0.1:*", "localhost:*", "[::1]:*"] for scheme in ("http", "https")]
 mcp.settings.transport_security = TransportSecuritySettings(
@@ -804,8 +804,8 @@ def insert_tracked_text(
     """Insert text into an .odt document as a tracked change (control de cambios)
 
     Stateless: takes the source .odt as a base64 blob and returns the modified
-    .odt as a base64 blob — it never touches the caller's filesystem or any
-    remote storage (Nextcloud, etc). The caller reads the source file, passes
+    .odt as a base64 blob — it never touches the caller's filesystem. The
+    caller reads the source file, passes
     its bytes here, and writes the returned bytes back wherever they came from.
 
     Unlike insert_text_at_position, this does NOT rewrite the document content.
@@ -1164,7 +1164,7 @@ def main():
             print("")
             print("Base64 Support:")
             print("  All document tools accept document_base64 / documents_base64 params")
-            print("  for stateless remote operation (e.g. via Docker on NAS).")
+            print("  for stateless remote operation (e.g. via Docker container).")
             print("  Use return_base64=True to get modified documents as base64.")
             print("")
             print("Testing:")

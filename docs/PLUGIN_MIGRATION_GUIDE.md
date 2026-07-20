@@ -74,7 +74,7 @@ cp ~/Documents/mcp/mcp.config.json ~/Documents/mcp/mcp.config.json.backup
 
 ```bash
 # Navigate to plugin directory
-cd /home/patrick/work/mcp/mcp-libre/plugin
+cd /path/to/mcp-libre/plugin
 
 # Check prerequisites
 ./install.sh status

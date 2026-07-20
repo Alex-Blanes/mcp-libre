@@ -30,7 +30,7 @@ ENV MCP_TRANSPORT=streamable-http
 ENV MCP_HOST=0.0.0.0
 ENV MCP_PORT=8765
 # Comma-separated extra host:port entries allowed past FastMCP's DNS-rebinding
-# check, e.g. the NAS's Tailscale IP/hostname. Override at `docker run` time.
+# check (e.g. a remote host or VPN IP). Override at `docker run` time.
 ENV MCP_ALLOWED_HOSTS=""
 
 EXPOSE 8765

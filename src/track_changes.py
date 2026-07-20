@@ -3,9 +3,9 @@ Tools for inserting text into ODT documents as tracked changes (LibreOffice's
 "Registrar cambios"), instead of silently rewriting the document content.
 
 Stateless by design: the document travels as a base64 blob in the request/response,
-not as a filesystem path. This lets the tool run anywhere (e.g. a Docker container on
-a NAS with no access to the caller's filesystem or Nextcloud credentials) — the caller
-is responsible for reading the source file and writing back the returned bytes.
+not as a filesystem path. This lets the tool run anywhere (e.g. a Docker container
+without access to the caller's filesystem) — the caller is responsible for reading
+the source file and writing back the returned bytes.
 
 The `uno` module required to talk to LibreOffice is only available inside
 LibreOffice's own bundled Python interpreter, not in this server's venv. So this
