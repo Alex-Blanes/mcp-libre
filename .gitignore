@@ -101,6 +101,9 @@ logs/
 local_config.json
 .env.local
 
+# Deployment instructions (local only, never pushed)
+AGENTS.deploy.md
+
 # MCP specific
 mcp_test_*
 temp_documents/

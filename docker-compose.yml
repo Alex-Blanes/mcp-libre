@@ -16,16 +16,13 @@ services:
 
       # Every host:port clients use to reach this server must be listed, or
       # FastMCP's DNS-rebinding check rejects the request before it is handled.
-      # Both LAN (192.168.1.60) and Tailscale (100.88.134.15) are listed so
-      # OpenCode can connect from inside or outside the home network.
-      MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-nas:8765,192.168.1.60:8765,100.88.134.15:8765}"
+      # Set this in .env (see .env.example). Example for LAN + Tailscale:
+      #   MCP_ALLOWED_HOSTS=myhost:8765,192.168.x.x:8765,100.x.x.x:8765
+      MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-}"
 
       # Base URL used to build download_url links returned by MCP tools.
-      # Only one URL can be set; the LAN IP is the primary one. When you connect
-      # via Tailscale, download_urls in tool responses will point to the LAN IP —
-      # you can still download by swapping the host in the URL, or just chain
-      # tools by doc_id (which never needs a URL).
-      MCP_PUBLIC_URL: "${MCP_PUBLIC_URL:-http://192.168.1.60:8765}"
+      # Set in .env. Example: MCP_PUBLIC_URL=http://192.168.x.x:8765
+      MCP_PUBLIC_URL: "${MCP_PUBLIC_URL:-}"
 
       # Protects POST/GET /files. Leave unset ONLY on a trusted LAN.
       MCP_UPLOAD_TOKEN: "${MCP_UPLOAD_TOKEN:-}"

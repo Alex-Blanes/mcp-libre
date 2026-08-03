@@ -1461,7 +1461,7 @@ def get_server_info() -> Dict[str, Any]:
     if not info["transfer"]["public_url_configured"]:
         info["hints"].append(
             "MCP_PUBLIC_URL is not set, so download_url fields will be null. Set it to the "
-            "URL clients reach this server on (e.g. http://nas:8765) to get working links."
+            "URL clients reach this server on (e.g. http://my-server:8765) to get working links."
         )
 
     if _TRANSPORT != "stdio" and not info["transfer"]["auth_required"]:

@@ -91,5 +91,5 @@ def test_list_handles_is_oldest_first(workspace):
 def test_download_url_needs_a_public_url(workspace, monkeypatch):
     handle = docstore.store(b"x", "x.odt")
     assert docstore.download_url(handle.doc_id) is None
-    monkeypatch.setenv("MCP_PUBLIC_URL", "http://nas:8765/")
-    assert docstore.download_url(handle.doc_id) == f"http://nas:8765/files/{handle.doc_id}"
+    monkeypatch.setenv("MCP_PUBLIC_URL", "http://my-server:8765/")
+    assert docstore.download_url(handle.doc_id) == f"http://my-server:8765/files/{handle.doc_id}"

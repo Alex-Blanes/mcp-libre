@@ -111,7 +111,7 @@ def test_url_auth_becomes_basic_auth(workspace, tmp_path, mock_transport, monkey
     monkeypatch.setenv("MCP_URL_ALLOWED_HOSTS", "nextcloud.example")
     calls = mock_transport.calls
     mock_transport(_recording(calls))
-    urlio.fetch("https://nextcloud.example/x.odt", tmp_path / "out.odt", url_auth="alex:pw")
+    urlio.fetch("https://nextcloud.example/x.odt", tmp_path / "out.odt", url_auth="user:pw")
     assert calls[0].headers["authorization"].startswith("Basic ")
 
 

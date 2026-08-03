@@ -1,0 +1,19 @@
+name: Deploy to NAS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: mcp-nas-deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and restart
+        working-directory: /volume1/docker/mcp-libre
+        run: sudo docker compose up -d --build
+
+      - name: Verify health
+        run: |
+          sleep 5
+          curl -sf http://127.0.0.1:8765/health || exit 1

@@ -80,7 +80,7 @@ def test_missing_path_points_at_the_better_options(workspace):
 def test_windows_path_on_a_posix_server_is_explained(workspace, monkeypatch):
     monkeypatch.setattr(libremcp, "_SERVER_OS", "Linux")
     with pytest.raises(FileNotFoundError, match="Windows-style"):
-        with _resolve_document(path=r"C:\Users\alex\x.odt"):
+        with _resolve_document(path=r"C:\Users\user\x.odt"):
             pass
 
 
@@ -114,9 +114,9 @@ def test_default_delivery_is_a_handle_not_base64(workspace, produced):
 
 
 def test_default_delivery_includes_a_url_when_public_url_is_set(workspace, produced, monkeypatch):
-    monkeypatch.setenv("MCP_PUBLIC_URL", "http://nas:8765")
+    monkeypatch.setenv("MCP_PUBLIC_URL", "http://my-server:8765")
     delivery = _deliver_result(produced)
-    assert delivery["download_url"] == f"http://nas:8765/files/{delivery['doc_id']}"
+    assert delivery["download_url"] == f"http://my-server:8765/files/{delivery['doc_id']}"
 
 
 def test_target_path_wins_and_writes_to_disk(workspace, produced, tmp_path):

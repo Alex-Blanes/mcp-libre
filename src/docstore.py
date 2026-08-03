@@ -208,7 +208,7 @@ def list_handles() -> List[DocHandle]:
 
 
 def public_base_url() -> Optional[str]:
-    """Base URL used to build download links, e.g. http://nas:8765."""
+    """Base URL used to build download links, e.g. http://my-server:8765."""
     base = os.environ.get("MCP_PUBLIC_URL", "").strip()
     return base.rstrip("/") or None
 

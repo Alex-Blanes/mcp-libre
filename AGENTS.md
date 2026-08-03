@@ -78,16 +78,16 @@ No upload step at all — the server moves the bytes itself:
 ```python
 # Read a document straight from Nextcloud
 await client.call_tool("read_document_text", {
-    "document_url": "https://nextcloud.example/remote.php/dav/files/alex/informe.odt",
-    "url_auth": "alex:app-password",
+    "document_url": "https://nextcloud.example/remote.php/dav/files/user/informe.odt",
+    "url_auth": "user:app-password",
 })
 
 # Convert and write the result back over WebDAV
 await client.call_tool("convert_document", {
-    "document_url": "https://nextcloud.example/remote.php/dav/files/alex/informe.odt",
+    "document_url": "https://nextcloud.example/remote.php/dav/files/user/informe.odt",
     "target_format": "pdf",
-    "target_url": "https://nextcloud.example/remote.php/dav/files/alex/informe.pdf",
-    "url_auth": "alex:app-password",
+    "target_url": "https://nextcloud.example/remote.php/dav/files/user/informe.pdf",
+    "url_auth": "user:app-password",
 })
 ```
 
