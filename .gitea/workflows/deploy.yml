@@ -9,9 +9,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and restart
-        working-directory: /volume1/docker/mcp-libre
-        run: sudo docker compose up -d --build
+      - name: Copy env from live deployment
+        run: cp /volume1/docker/mcp-libre/.env .env 2>/dev/null || true
+
+      - name: Build and deploy
+        run: docker compose up -d --build
 
       - name: Verify health
         run: |
