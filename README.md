@@ -144,6 +144,39 @@ python src/main.py --test
 | `create_live_editing_session` | Start live editing with real-time preview |
 | `watch_document_changes` | Monitor document changes in real-time |
 | `refresh_document_in_libreoffice` | Force document refresh in GUI |
+| `fetch_document` | Pull a URL into server-side storage, returns a `doc_id` |
+| `list_stored_documents` / `delete_document` | Manage stored document handles |
+| `insert_tracked_text` | Insert text as a LibreOffice tracked change |
+
+## 📦 Getting documents to a remote server
+
+When the server runs somewhere else (Docker on a NAS, say), it cannot see your
+filesystem — `path` refers to *its* disk. Send documents in one of these ways,
+best first:
+
+1. **`doc_id`** — upload once over plain HTTP, then work by handle:
+   ```bash
+   curl -H "Authorization: Bearer $MCP_UPLOAD_TOKEN" \
+        --data-binary @informe.odt \
+        "http://your-server:8765/files?filename=informe.odt"
+   # → {"doc_id": "8c146cac…", "download_url": "…"}
+   ```
+   Pass that `doc_id` to any tool. Each tool returns a **new** `doc_id`, so
+   create → edit → convert chains without the bytes ever entering the
+   conversation. Download the result from `/files/{doc_id}`.
+
+2. **`document_url` / `target_url`** — hand the server an http(s)/WebDAV URL and
+   it moves the bytes itself. `url_auth="user:password"` for Nextcloud.
+
+3. **`path`** — only for files on the server's own filesystem.
+
+4. **`document_base64`** — still supported, but it costs ~1.33 bytes of model
+   context per document byte on *every* call. Use it only when the client can't
+   make an HTTP request of its own.
+
+Call `get_server_info()` to see the upload endpoint, whether a token is required,
+and the handle TTL for a given deployment. Full details and the environment
+variable reference are in [AGENTS.md](AGENTS.md).
 
 ## 📚 Documentation
 

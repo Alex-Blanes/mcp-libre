@@ -1,0 +1,46 @@
+services:
+  mcp-libre:
+    build: .
+    image: mcp-libre:latest
+    container_name: mcp-libre
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      # Document handles. Keeps uploads across restarts; nothing else lives here.
+      - ./data:/data
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8765"
+
+      # Every host:port clients use to reach this server must be listed, or
+      # FastMCP's DNS-rebinding check rejects the request before it is handled.
+      # Both LAN (192.168.1.60) and Tailscale (100.88.134.15) are listed so
+      # OpenCode can connect from inside or outside the home network.
+      MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-nas:8765,192.168.1.60:8765,100.88.134.15:8765}"
+
+      # Base URL used to build download_url links returned by MCP tools.
+      # Only one URL can be set; the LAN IP is the primary one. When you connect
+      # via Tailscale, download_urls in tool responses will point to the LAN IP —
+      # you can still download by swapping the host in the URL, or just chain
+      # tools by doc_id (which never needs a URL).
+      MCP_PUBLIC_URL: "${MCP_PUBLIC_URL:-http://192.168.1.60:8765}"
+
+      # Protects POST/GET /files. Leave unset ONLY on a trusted LAN.
+      MCP_UPLOAD_TOKEN: "${MCP_UPLOAD_TOKEN:-}"
+
+      MCP_WORKSPACE: /data/workspace
+      MCP_DOC_TTL: "${MCP_DOC_TTL:-3600}"
+      MCP_MAX_DOC_MB: "${MCP_MAX_DOC_MB:-50}"
+
+      # Hosts the server may fetch document_url from / PUT target_url to.
+      # Empty means "any public host"; loopback and link-local stay blocked.
+      MCP_URL_ALLOWED_HOSTS: "${MCP_URL_ALLOWED_HOSTS:-}"
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8765/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

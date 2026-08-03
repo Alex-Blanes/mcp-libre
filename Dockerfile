@@ -33,6 +33,23 @@ ENV MCP_PORT=8765
 # check, e.g. your remote server's IP/hostname. Override at `docker run` time.
 ENV MCP_ALLOWED_HOSTS=""
 
+# --- document transfer ---------------------------------------------------
+# Uploaded/produced documents live here as short-lived handles (doc_id), so
+# clients never have to push base64 through the MCP channel. Mount a volume if
+# you want them to survive a container restart.
+ENV MCP_WORKSPACE=/data/workspace
+ENV MCP_DOC_TTL=3600
+ENV MCP_MAX_DOC_MB=50
+# The URL clients reach this server on; without it download_url fields are null.
+ENV MCP_PUBLIC_URL=""
+# MCP_UPLOAD_TOKEN is deliberately NOT declared here — pass it at run time
+# (-e MCP_UPLOAD_TOKEN=...) so it never gets baked into an image layer. Leaving
+# it unset means the /files store is OPEN to anyone who can reach the port.
+# Allowlist for document_url/target_url fetches (comma-separated hosts).
+ENV MCP_URL_ALLOWED_HOSTS=""
+
+VOLUME ["/data"]
+
 EXPOSE 8765
 
 ENTRYPOINT ["/app/.venv/bin/python", "src/main.py"]

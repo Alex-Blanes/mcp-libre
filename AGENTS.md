@@ -19,130 +19,155 @@ The MCP server is configured in `~/.opencode/opencode.json`:
 
 ## Before using any tool (READ FIRST)
 
-This MCP runs remotely (Docker on Linux). It has no access to your local machine's filesystem.
+This MCP runs remotely (Docker on Linux). It has **no access to your local machine's
+filesystem**, so `path` only ever refers to the *server's* disk.
 
-### Golden rule
+Get the document to the server one of these ways, best first:
 
-If the document is on your local machine → **Do NOT use `path`**. Always use `document_base64`.
+| # | Way in | When |
+|---|---|---|
+| 1 | **`doc_id`** | Default. Upload once over plain HTTP, then work by handle |
+| 2 | **`document_url`** | The file already has a URL the server can reach (Nextcloud/WebDAV) |
+| 3 | **`path`** | The file is on the server's own filesystem |
+| 4 | **`document_base64`** | Last resort: the client cannot make an HTTP request itself |
 
-### What to do if you see "Document not found"
+### Why not base64
 
-1. **Quick diagnosis**: call `get_server_info()` to verify platform and LO version
-2. **Most common cause**: you passed a local path to the remote Linux server
-3. **Solution**: read the local file with your local MCP (e.g. FileSystem tool), encode it to base64, and pass it as `document_base64=<b64_content>`
+A base64 blob travels *through the model's context*: ~1.33 bytes of context per byte
+of document, on **every call**. A 100 KB .odt is ~35k tokens, and a create → edit →
+convert chain pays it three times. Handles cost ~32 characters.
 
-## Base64 pattern (stateless) — Full workflow
+## The doc_id workflow
 
-All tools accept `document_base64` / `documents_base64` as an alternative to file paths. The server never accesses the client's local filesystem — documents travel as base64 in the request/response.
+```bash
+# 1. Upload once — plain HTTP, outside the MCP channel, zero tokens
+curl -H "Authorization: Bearer $MCP_UPLOAD_TOKEN" \
+     --data-binary @informe.odt \
+     "http://your-server:8765/files?filename=informe.odt"
+# → {"doc_id":"8c146cac38b44ee58e873b54c70a584f", "download_url":"...", ...}
 
-### Typical workflow with OpenCode / Claude Code
+# 2. Work by handle over MCP. Every tool returns a NEW doc_id, so steps chain:
+#      insert_text_at_position(doc_id="8c14…")      → doc_id "9a93…"
+#      convert_document(doc_id="9a93…", target_format="pdf") → doc_id "7acb…"
+#    The source is never modified; each step produces a new handle.
 
+# 3. Download the result
+curl -H "Authorization: Bearer $MCP_UPLOAD_TOKEN" \
+     -O -J "http://your-server:8765/files/7acbd502966e40f3af63b2aa2f85bf7f"
 ```
-You have a document at ~/document.odt
 
-STEP 1: Read the local file
-  → Use your local MCP (e.g. FileSystem) to read the file bytes
+Handles expire after `MCP_DOC_TTL` (default 1h). `list_stored_documents()` shows what's
+live; `delete_document(doc_id)` drops one early.
 
-STEP 2: Encode to base64
-  → Convert the bytes to base64
+### HTTP endpoints
 
-STEP 3: Call the MCP tool with document_base64
-  → Pass the encoded content as document_base64=<b64>
+| Route | Method | Purpose |
+|---|---|---|
+| `/files?filename=x.odt` | POST | Upload raw body (or multipart) → `doc_id` |
+| `/files/{doc_id}` | GET | Download |
+| `/files/{doc_id}` | DELETE | Drop the handle |
+| `/health` | GET | Liveness (never requires a token) |
 
-STEP 4: Save the result (if the tool returns base64)
-  → Decode result_base64 and write to the local file
-```
+`/files*` requires `Authorization: Bearer $MCP_UPLOAD_TOKEN` when that variable is set.
+**If it isn't set, the store is open to anyone who can reach the port.**
 
-### Example: read text from a document
+## The URL workflow
+
+No upload step at all — the server moves the bytes itself:
 
 ```python
-import base64
-
-# 1. Read local file
-with open("~/document.odt", "rb") as f:
-    doc_b64 = base64.b64encode(f.read()).decode("ascii")
-
-# 2. Call the MCP
-result = await client.call_tool("read_document_text", {
-    "document_base64": doc_b64
+# Read a document straight from Nextcloud
+await client.call_tool("read_document_text", {
+    "document_url": "https://nextcloud.example/remote.php/dav/files/alex/informe.odt",
+    "url_auth": "alex:app-password",
 })
 
-# Result is plain text
-print(result.content)
-```
-
-### Example: modify and save
-
-```python
-import base64
-
-# 1. Read local file
-with open("~/document.odt", "rb") as f:
-    doc_b64 = base64.b64encode(f.read()).decode("ascii")
-
-# 2. Insert text as a tracked change
-result = await client.call_tool("insert_tracked_text", {
-    "document_base64": doc_b64,
-    "anchor_text": "Existing text",
-    "new_text": "New text to insert",
-    "author": "First Last",
-    "insert_mode": "after"
+# Convert and write the result back over WebDAV
+await client.call_tool("convert_document", {
+    "document_url": "https://nextcloud.example/remote.php/dav/files/alex/informe.odt",
+    "target_format": "pdf",
+    "target_url": "https://nextcloud.example/remote.php/dav/files/alex/informe.pdf",
+    "url_auth": "alex:app-password",
 })
-
-# 3. Save the modified document
-if result.structuredContent.get("success"):
-    modified_b64 = result.structuredContent["document_base64"]
-    with open("~/document_modified.odt", "wb") as f:
-        f.write(base64.b64decode(modified_b64))
 ```
+
+`fetch_document(document_url)` ingests a URL into a `doc_id` without doing anything else.
+
+Fetches are guarded: set `MCP_URL_ALLOWED_HOSTS` for a strict allowlist. With it unset,
+loopback/link-local/reserved addresses are refused and everything else is allowed.
 
 ## Available tools
 
-| Tool | Input base64 | Output base64 | Description |
-|---|---|---|---|
-| `get_server_info` | — | — | Server info (OS, LO version, Docker, hints) |
-| `create_document` | `return_base64=True` | `result_base64` | Create a new document |
-| `read_document_text` | `document_base64` | — (plain text) | Extract text |
-| `convert_document` | `document_base64` | `result_base64` | Convert format |
-| `get_document_info` | `document_base64` | — (metadata) | Document info |
-| `read_spreadsheet_data` | `document_base64` | — (CSV data) | Read spreadsheet |
-| `insert_text_at_position` | `document_base64` | `result_base64` | Insert text (start/end/replace) |
-| `insert_tracked_text` | `document_base64` | `result_base64` | Insert as tracked change |
-| `get_document_statistics` | `document_base64` | — (stats) | Document statistics |
-| `search_documents` | `documents_base64` | — (results) | Search text in documents |
-| `merge_text_documents` | `documents_base64` | `result_base64` | Merge documents |
-| `open_document_in_libreoffice` | `document_base64` | — | Open in LO GUI (persistent tmp) |
-| `create_live_editing_session` | `document_base64` | — | Live editing session |
+Every tool below accepts `doc_id`, `document_url`, `path` and `document_base64` as input
+(plural `doc_ids` / `document_urls` / `documents_base64` where it takes a list).
+
+| Tool | Output | Description |
+|---|---|---|
+| `get_server_info` | info + `transfer` block | Platform, LO version, and how to send documents |
+| `create_document` | `doc_id` | Create a new document |
+| `read_document_text` | plain text | Extract text |
+| `convert_document` | `doc_id` | Convert format |
+| `get_document_info` | metadata | Document info |
+| `read_spreadsheet_data` | CSV data | Read spreadsheet |
+| `insert_text_at_position` | `doc_id` | Insert text (start/end/replace) |
+| `insert_tracked_text` | `doc_id` | Insert as a tracked change |
+| `get_document_statistics` | stats | Document statistics |
+| `search_documents` | results | Search text in documents |
+| `merge_text_documents` | `doc_id` | Merge documents |
+| `fetch_document` | `doc_id` | Pull a URL into server-side storage |
+| `list_stored_documents` / `delete_document` | — | Manage handles |
+| `batch_convert_documents` | paths | Server-side directory conversion |
+| `open_document_in_libreoffice`, `refresh_document_in_libreoffice`, `watch_document_changes`, `create_live_editing_session` | — | Server-side GUI only; `path` only |
+
+Tools that produce a document write it wherever you ask:
+
+| You pass | You get |
+|---|---|
+| nothing | `doc_id` + `download_url` (default) |
+| `target_url` | the file PUT to that URL |
+| `target_path` / `output_path` | written to the **server's** filesystem |
+| `return_base64=True` | `result_base64` inline (expensive) |
 
 ## Remote Deployment (Docker)
 
 ```bash
-# Build
-docker build -t mcp-libre .
+docker compose up -d          # see docker-compose.yml
+```
 
-# Run
-docker run -d \
-  --name mcp-libre \
-  -p 8765:8765 \
+or by hand:
+
+```bash
+docker build -t mcp-libre .
+docker run -d --name mcp-libre -p 8765:8765 \
+  -v ./data:/data \
   -e MCP_ALLOWED_HOSTS="your-server:8765" \
+  -e MCP_PUBLIC_URL="http://your-server:8765" \
+  -e MCP_UPLOAD_TOKEN="$(openssl rand -hex 24)" \
   --restart unless-stopped \
   mcp-libre
-
-# Logs
-docker logs mcp-libre
-
-# Stop/remove
-docker stop mcp-libre && docker rm mcp-libre
 ```
+
+### Environment
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MCP_TRANSPORT` | `stdio` | `streamable-http` to serve over the network |
+| `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8765` | Bind address |
+| `MCP_ALLOWED_HOSTS` | — | **Required remotely.** `host:port` entries allowed past FastMCP's DNS-rebinding check |
+| `MCP_PUBLIC_URL` | — | URL clients reach the server on; without it `download_url` is null |
+| `MCP_UPLOAD_TOKEN` | — | Bearer token for `/files`. Unset = open store |
+| `MCP_WORKSPACE` | temp dir | Where handles are stored |
+| `MCP_DOC_TTL` | `3600` | Handle lifetime in seconds (`0` = never expire) |
+| `MCP_MAX_DOC_MB` | `50` | Size cap for uploads and URL fetches |
+| `MCP_URL_ALLOWED_HOSTS` | — | Allowlist for `document_url` / `target_url` |
+| `MCP_URL_BEARER` | — | Bearer token sent with URL fetches |
+| `SOFFICE_BIN` | — | Explicit path to `soffice` when it isn't on `PATH` |
+| `LIBREOFFICE_PYTHON` | — | LibreOffice's bundled Python (needed by `insert_tracked_text`) |
 
 ## Local Development
 
 ```bash
-# Activate venv and test
-cd src
-python main.py --test
-
-# Or via MCP test client
-cd tests
-python test_client.py
+uv run pytest                 # unit tests, no LibreOffice needed
+python src/main.py --test     # functional smoke test
+python tests/test_client.py   # drive it as an MCP client
 ```

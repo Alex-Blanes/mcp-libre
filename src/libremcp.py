@@ -12,21 +12,25 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Annotated, Any, Dict, Generator, List, Optional, Union
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from track_changes import TrackedInsertResult, insert_tracked_text_impl
+import docstore
+import http_routes
+import urlio
+from track_changes import TrackedInsertResult, insert_tracked_text_in_file
 
 # Transport is stdio by default (local use from Claude Code on this laptop).
 # Set MCP_TRANSPORT=streamable-http (+ MCP_HOST/MCP_PORT/MCP_ALLOWED_HOSTS) to run
@@ -54,6 +58,28 @@ mcp.settings.transport_security = TransportSecuritySettings(
     + [f"https://{h}" for h in _EXTRA_ALLOWED_HOSTS],
 )
 
+# Plain-HTTP upload/download for the document store. Only meaningful when we're
+# serving HTTP at all; under stdio there is no app to attach them to.
+if _TRANSPORT != "stdio":
+    http_routes.register_routes(mcp)
+
+
+def _ensure_aware(value: Any) -> Any:
+    """Attach UTC to naive datetimes.
+
+    The tool output schemas declare `format: "date-time"`, which is RFC 3339 and
+    *requires* a UTC offset. A naive datetime serializes as "2026-08-03T12:00:00.123456",
+    which strict client-side validators (ajv with format checking) reject — that
+    surfaced as `modified_time must match format "date-time"`. Producers should hand
+    us aware datetimes; this is the belt-and-braces so a naive one can never escape.
+    """
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+AwareDatetime = Annotated[datetime, BeforeValidator(_ensure_aware)]
+
 
 # Data models for structured responses
 class DocumentInfo(BaseModel):
@@ -62,7 +88,7 @@ class DocumentInfo(BaseModel):
     filename: str = Field(description="Document filename")
     format: str = Field(description="Document format (odt, ods, odp, etc.)")
     size_bytes: int = Field(description="File size in bytes")
-    modified_time: datetime = Field(description="Last modification time")
+    modified_time: AwareDatetime = Field(description="Last modification time (UTC, RFC 3339)")
     exists: bool = Field(description="Whether the file exists")
 
 
@@ -83,6 +109,8 @@ class ConversionResult(BaseModel):
     success: bool = Field(description="Whether conversion was successful")
     error_message: Optional[str] = Field(description="Error message if conversion failed")
     result_base64: Optional[str] = Field(default=None, description="Base64-encoded converted document (base64 mode)")
+    doc_id: Optional[str] = Field(default=None, description="Server-side handle for the result; pass it as 'doc_id' to other tools")
+    download_url: Optional[str] = Field(default=None, description="HTTP URL to download the converted document")
 
 
 class SpreadsheetData(BaseModel):
@@ -101,17 +129,23 @@ class DocResult(BaseModel):
     filename: Optional[str] = Field(default=None, description="Document filename")
     format: Optional[str] = Field(default=None, description="Document format")
     size_bytes: Optional[int] = Field(default=None, description="File size in bytes")
-    modified_time: Optional[datetime] = Field(default=None, description="Last modification time")
+    modified_time: Optional[AwareDatetime] = Field(default=None, description="Last modification time (UTC, RFC 3339)")
     exists: Optional[bool] = Field(default=None, description="Whether the file exists")
     result_base64: Optional[str] = Field(default=None, description="Base64-encoded result document (base64 mode)")
+    doc_id: Optional[str] = Field(default=None, description="Server-side handle for the result; pass it as 'doc_id' to other tools")
+    download_url: Optional[str] = Field(default=None, description="HTTP URL to download the result document")
 
 
 # Helper functions
 def _run_libreoffice_command(args: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
     """Run a LibreOffice command with proper error handling"""
+    # SOFFICE_BIN wins when set (the Dockerfile sets it, and on Windows the
+    # binary is installed outside PATH); otherwise fall back to the usual names.
+    configured = os.environ.get("SOFFICE_BIN", "").strip()
+    candidates = ([configured] if configured else []) + ['libreoffice', 'loffice', 'soffice']
+
     try:
-        # Try different common LibreOffice executable names
-        for executable in ['libreoffice', 'loffice', 'soffice']:
+        for executable in candidates:
             try:
                 cmd = [executable] + args
                 result = subprocess.run(
@@ -134,13 +168,21 @@ def _run_libreoffice_command(args: List[str], timeout: int = 30) -> subprocess.C
 def _get_document_info(file_path: str) -> DocumentInfo:
     """Get information about a document file"""
     path = Path(file_path)
+    # One stat() call: the file can vanish between exists() and stat(), and two
+    # separate stat()s could even report different sizes/mtimes.
+    try:
+        st = path.stat()
+    except OSError:
+        st = None
     return DocumentInfo(
         path=str(path.absolute()),
         filename=path.name,
         format=path.suffix.lower().lstrip('.'),
-        size_bytes=path.stat().st_size if path.exists() else 0,
-        modified_time=datetime.fromtimestamp(path.stat().st_mtime) if path.exists() else datetime.now(),
-        exists=path.exists()
+        size_bytes=st.st_size if st else 0,
+        modified_time=(
+            datetime.fromtimestamp(st.st_mtime, tz=timezone.utc) if st else datetime.now(timezone.utc)
+        ),
+        exists=st is not None,
     )
 
 
@@ -162,17 +204,55 @@ def _is_windows_path(p: str) -> bool:
     return bool(_WINDOWS_PATH_RE.match(str(p)))
 
 
+_NO_SOURCE_HELP = (
+    "Provide the document in one of these ways, best first:\n"
+    "  1. doc_id — upload once with: "
+    "curl --data-binary @file.odt '<server>/files?filename=file.odt', then pass the returned doc_id\n"
+    "  2. document_url — an http(s)/WebDAV URL the server can fetch itself\n"
+    "  3. path — only for files on the server's own filesystem\n"
+    "  4. document_base64 — last resort; it costs ~1.33 bytes of your context per document byte"
+)
+
+
 @contextmanager
 def _resolve_document(
     path: Optional[str] = None,
     document_base64: Optional[str] = None,
     format_hint: str = "writer",
+    doc_id: Optional[str] = None,
+    document_url: Optional[str] = None,
+    url_auth: Optional[str] = None,
+    for_writing: bool = False,
 ) -> Generator[str, None, None]:
-    """Resolve a document from either a filesystem path or base64 content.
+    """Resolve a document from a handle, a URL, base64 content, or a path.
 
-    If document_base64 is provided, writes it to a temp file and cleans up
-    on exit. If path is provided, validates it exists and yields it directly.
+    Precedence: doc_id > document_url > document_base64 > path. The first three
+    land in (or already live in) server-side storage so the bytes never travel
+    through the MCP channel; temp copies are cleaned up on exit.
+
+    Set for_writing=True in tools that modify the document: a stored handle is
+    then resolved to a scratch copy, so the caller's original stays intact and
+    the edit comes back as a new handle.
     """
+    if doc_id is not None:
+        stored = docstore.resolve(doc_id)
+        if not for_writing:
+            yield str(stored)
+            return
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            scratch = Path(tmp_dir) / stored.name
+            shutil.copyfile(stored, scratch)
+            yield str(scratch)
+        return
+
+    if document_url is not None:
+        ext = Path(urlio.filename_from_url(document_url)).suffix or _format_extensions.get(format_hint, ".odt")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            doc_path = Path(tmp_dir) / f"document{ext}"
+            urlio.fetch(document_url, doc_path, url_auth=url_auth)
+            yield str(doc_path)
+        return
+
     if document_base64 is not None:
         ext = _format_extensions.get(format_hint, ".odt")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -180,6 +260,7 @@ def _resolve_document(
             doc_path.write_bytes(base64.b64decode(document_base64))
             yield str(doc_path)
         return
+
     if path is not None:
         normalized = str(path).replace('\\', '/')
         p = Path(normalized)
@@ -189,21 +270,54 @@ def _resolve_document(
                     f"Path '{path}' is a Windows-style path but this MCP server "
                     f"runs on {_SERVER_OS} (Docker container).\n"
                     f"Windows filesystem paths are NOT accessible from the server.\n\n"
-                    f"👉 Read your local file first, encode it to base64, and call "
-                    f"this tool with the 'document_base64' parameter instead.\n\n"
-                    f"Example workflow:\n"
-                    f"  1. Read file bytes from your local machine\n"
-                    f"  2. Base64-encode the bytes\n"
-                    f"  3. Pass as: document_base64=<encoded_content>"
+                    f"{_NO_SOURCE_HELP}"
                 )
             raise FileNotFoundError(
-                f"Document not found: {path}. "
-                f"If the file is on your local machine and this is a remote MCP "
-                f"server, pass the file content as 'document_base64' instead of 'path'."
+                f"Document not found on the server: {path}.\n\n{_NO_SOURCE_HELP}"
             )
         yield normalized
         return
-    raise ValueError("Either 'path' or 'document_base64' must be provided")
+
+    raise ValueError(f"No document source given.\n\n{_NO_SOURCE_HELP}")
+
+
+def _deliver_result(
+    produced: Path,
+    *,
+    target_path: Optional[str] = None,
+    target_url: Optional[str] = None,
+    return_base64: bool = False,
+    url_auth: Optional[str] = None,
+    filename: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Hand a freshly produced document back to the caller.
+
+    Precedence: target_path (server filesystem) > target_url (PUT/WebDAV) >
+    return_base64 > a stored handle. The last one is the default, and the point
+    of the whole exercise: chaining tools by doc_id keeps the bytes out of the
+    model's context entirely.
+
+    Returns the fields to merge into the tool's result model.
+    """
+    produced = Path(produced)
+    name = filename or produced.name
+
+    if target_path:
+        final = Path(str(target_path).replace('\\', '/'))
+        final.parent.mkdir(parents=True, exist_ok=True)
+        if final.resolve() != produced.resolve():
+            shutil.copyfile(produced, final)
+        return {"path": str(final.absolute())}
+
+    if target_url:
+        urlio.put(target_url, produced, url_auth=url_auth)
+        return {"download_url": target_url}
+
+    if return_base64:
+        return {"result_base64": _read_as_base64(str(produced))}
+
+    handle = docstore.store_file(produced, name)
+    return {"doc_id": handle.doc_id, "download_url": docstore.download_url(handle.doc_id)}
 
 
 def _read_as_base64(path: str) -> str:
@@ -214,19 +328,33 @@ def _read_as_base64(path: str) -> str:
 # Core LibreOffice Tools
 
 @mcp.tool()
-def create_document(path: Optional[str] = None, doc_type: str = "writer", content: str = "", return_base64: bool = False) -> DocResult:
+def create_document(
+    path: Optional[str] = None,
+    doc_type: str = "writer",
+    content: str = "",
+    return_base64: bool = False,
+    target_url: Optional[str] = None,
+    url_auth: Optional[str] = None,
+) -> DocResult:
     """Create a new LibreOffice document
-    
+
+    By default the document is kept on the server and you get back a `doc_id`
+    (plus a download URL). Pass that doc_id to the other tools to keep working on
+    it — the file's bytes never enter the conversation.
+
     Args:
-        path: Full path where the document should be created (omit for base64 mode)
+        path: Write to this path on the SERVER's filesystem (rarely what you want remotely)
         doc_type: Type of document to create (writer, calc, impress, draw)
         content: Initial content for the document (for writer documents)
-        return_base64: If True, return the document as base64 instead of writing to disk
+        return_base64: Return the document inline as base64 (expensive; last resort)
+        target_url: Upload the result to this URL with PUT (WebDAV/Nextcloud)
+        url_auth: "user:password" for target_url, if it needs authentication
     """
-    # Determine mode
-    use_base64 = return_base64 or not path
-    
-    if use_base64:
+    # Anything other than an explicit server path is built in a temp dir and
+    # then handed over by _deliver_result.
+    use_temp = bool(target_url) or return_base64 or not path
+
+    if use_temp:
         _tmp_manager = tempfile.TemporaryDirectory()
         path_obj = Path(_tmp_manager.name) / f"document{_format_extensions.get(doc_type, '.odt')}"
     else:
@@ -336,10 +464,21 @@ def create_document(path: Optional[str] = None, doc_type: str = "writer", conten
                 path_obj.touch()
         
         doc_info = _get_document_info(str(path_obj))
-        if use_base64:
-            return DocResult(**doc_info.model_dump(), success=True, result_base64=_read_as_base64(str(path_obj)))
-        return DocResult(**doc_info.model_dump(), success=True)
-        
+        if not use_temp:
+            return DocResult(**doc_info.model_dump(), success=True)
+
+        delivery = _deliver_result(
+            path_obj,
+            target_url=target_url,
+            return_base64=return_base64,
+            url_auth=url_auth,
+            filename=f"document{format_map[doc_type]}",
+        )
+        fields = doc_info.model_dump()
+        # The temp path is about to be deleted; don't hand the caller a dead path.
+        fields.pop("path", None)
+        return DocResult(**fields, success=True, **delivery)
+
     except Exception as e:
         return DocResult(success=False, error=str(e))
     finally:
@@ -348,15 +487,24 @@ def create_document(path: Optional[str] = None, doc_type: str = "writer", conten
 
 
 @mcp.tool()
-def read_document_text(path: Optional[str] = None, document_base64: Optional[str] = None) -> TextContent:
+def read_document_text(
+    path: Optional[str] = None,
+    document_base64: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    document_url: Optional[str] = None,
+    url_auth: Optional[str] = None,
+) -> TextContent:
     """Extract text content from a LibreOffice document
-    
+
     Args:
-        path: Path to the document file (omit if using document_base64)
-        document_base64: Base64-encoded document content (alternative to path)
+        path: Path on the SERVER's filesystem
+        document_base64: Base64-encoded document content (expensive; last resort)
+        doc_id: Handle from a previous tool or from POST /files (preferred)
+        document_url: http(s)/WebDAV URL the server fetches itself
+        url_auth: "user:password" for document_url, if it needs authentication
     """
     try:
-        with _resolve_document(path, document_base64) as resolved_path:
+        with _resolve_document(path, document_base64, doc_id=doc_id, document_url=document_url, url_auth=url_auth) as resolved_path:
             path_obj = Path(resolved_path)
             
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -446,31 +594,54 @@ def convert_document(
     target_format: str = "pdf",
     document_base64: Optional[str] = None,
     return_base64: bool = False,
+    doc_id: Optional[str] = None,
+    document_url: Optional[str] = None,
+    target_url: Optional[str] = None,
+    url_auth: Optional[str] = None,
 ) -> ConversionResult:
     """Convert a document to a different format
-    
+
+    By default the converted file stays on the server and you get a `doc_id` and
+    a download URL back, so the bytes never enter the conversation.
+
     Args:
-        source_path: Path to the source document (omit if using document_base64)
-        target_path: Path where converted document should be saved (omit for base64 output)
+        source_path: Path on the SERVER's filesystem
+        target_path: Write the result to this path on the SERVER's filesystem
         target_format: Target format (pdf, docx, xlsx, pptx, html, txt, etc.)
-        document_base64: Base64-encoded source document (alternative to source_path)
-        return_base64: If True, return the converted document as base64
+        document_base64: Base64-encoded source document (expensive; last resort)
+        return_base64: Return the converted document inline as base64 (expensive)
+        doc_id: Source handle from a previous tool or from POST /files (preferred)
+        document_url: http(s)/WebDAV URL of the source; the server fetches it
+        target_url: Upload the result to this URL with PUT (WebDAV/Nextcloud)
+        url_auth: "user:password" for document_url/target_url, if needed
     """
-    use_base64_input = document_base64 is not None
-    use_base64_output = return_base64 or (use_base64_input and not target_path)
-    
+    use_source_path = doc_id is None and document_url is None and document_base64 is None
+    # Build in a temp dir unless the caller wants it written straight to a server path.
+    use_temp_target = not target_path
+
+    def _source_label(source_obj: Path) -> str:
+        if doc_id:
+            return f"(doc_id:{doc_id})"
+        if document_url:
+            return document_url
+        if not use_source_path:
+            return "(base64)"
+        return source_path or str(source_obj)
+
     try:
-        with _resolve_document(source_path, document_base64) as resolved_source:
+        with _resolve_document(
+            source_path, document_base64, doc_id=doc_id, document_url=document_url, url_auth=url_auth
+        ) as resolved_source:
             source_obj = Path(resolved_source)
-            
-            if use_base64_output:
+
+            if use_temp_target:
                 _tmp_manager = tempfile.TemporaryDirectory()
-                resolved_target = Path(_tmp_manager.name) / f"output.{target_format}"
+                resolved_target = Path(_tmp_manager.name) / f"{source_obj.stem}.{target_format}"
             else:
                 _tmp_manager = None
-                resolved_target = Path(target_path)
+                resolved_target = Path(str(target_path).replace('\\', '/'))
                 resolved_target.parent.mkdir(parents=True, exist_ok=True)
-            
+
             try:
                 result = _run_libreoffice_command([
                     '--headless',
@@ -478,31 +649,39 @@ def convert_document(
                     '--outdir', str(resolved_target.parent),
                     str(source_obj)
                 ])
-                
+
                 expected_output = resolved_target.parent / (source_obj.stem + f'.{target_format}')
                 if expected_output.exists() and expected_output != resolved_target:
                     expected_output.rename(resolved_target)
-                
+
                 success = resolved_target.exists()
                 error_msg = None if success else f"Conversion failed. LibreOffice output: {result.stderr}"
-                
+
                 conv_result = ConversionResult(
-                    source_path=str(source_obj) if use_base64_input else (source_path or str(source_obj)),
-                    target_path=str(resolved_target),
+                    source_path=_source_label(source_obj),
+                    target_path=str(resolved_target) if not use_temp_target else "",
                     source_format=source_obj.suffix.lower().lstrip('.'),
                     target_format=target_format,
                     success=success,
                     error_message=error_msg,
                 )
-                
-                if success and use_base64_output:
-                    conv_result.result_base64 = _read_as_base64(str(resolved_target))
-                
+
+                if success and use_temp_target:
+                    delivery = _deliver_result(
+                        resolved_target,
+                        target_url=target_url,
+                        return_base64=return_base64,
+                        url_auth=url_auth,
+                        filename=resolved_target.name,
+                    )
+                    for key, value in delivery.items():
+                        setattr(conv_result, key if key != "path" else "target_path", value)
+
                 return conv_result
-                
+
             except Exception as e:
                 return ConversionResult(
-                    source_path=str(source_obj) if use_base64_input else (source_path or str(source_obj)),
+                    source_path=_source_label(source_obj),
                     target_path=str(resolved_target),
                     source_format=source_obj.suffix.lower().lstrip('.'),
                     target_format=target_format,
@@ -512,10 +691,10 @@ def convert_document(
             finally:
                 if _tmp_manager:
                     _tmp_manager.cleanup()
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError, urlio.UrlTransferError, docstore.DocStoreError) as e:
         return ConversionResult(
-            source_path=source_path or "(base64)",
-            target_path=target_path or "(base64)",
+            source_path=source_path or document_url or (f"(doc_id:{doc_id})" if doc_id else "(base64)"),
+            target_path=target_path or "",
             source_format="",
             target_format=target_format,
             success=False,
@@ -524,29 +703,52 @@ def convert_document(
 
 
 @mcp.tool()
-def get_document_info(path: Optional[str] = None, document_base64: Optional[str] = None) -> DocumentInfo:
+def get_document_info(
+    path: Optional[str] = None,
+    document_base64: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    document_url: Optional[str] = None,
+    url_auth: Optional[str] = None,
+) -> DocumentInfo:
     """Get detailed information about a LibreOffice document
-    
+
+    Note: for non-path sources the reported path/modified_time describe the
+    server-side copy, not any original on your machine.
+
     Args:
-        path: Path to the document file (omit if using document_base64)
-        document_base64: Base64-encoded document content (alternative to path)
+        path: Path on the SERVER's filesystem
+        document_base64: Base64-encoded document content (expensive; last resort)
+        doc_id: Handle from a previous tool or from POST /files (preferred)
+        document_url: http(s)/WebDAV URL the server fetches itself
+        url_auth: "user:password" for document_url, if it needs authentication
     """
-    with _resolve_document(path, document_base64) as resolved_path:
+    with _resolve_document(path, document_base64, doc_id=doc_id, document_url=document_url, url_auth=url_auth) as resolved_path:
         return _get_document_info(resolved_path)
 
 
 @mcp.tool()
-def read_spreadsheet_data(path: Optional[str] = None, document_base64: Optional[str] = None, sheet_name: Optional[str] = None, max_rows: int = 100) -> SpreadsheetData:
+def read_spreadsheet_data(
+    path: Optional[str] = None,
+    document_base64: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+    max_rows: int = 100,
+    doc_id: Optional[str] = None,
+    document_url: Optional[str] = None,
+    url_auth: Optional[str] = None,
+) -> SpreadsheetData:
     """Read data from a LibreOffice Calc spreadsheet
     
     Args:
-        path: Path to the spreadsheet file (.ods, .xlsx, etc.; omit if using document_base64)
-        document_base64: Base64-encoded spreadsheet content (alternative to path)
+        path: Path on the SERVER's filesystem (.ods, .xlsx, etc.)
+        document_base64: Base64-encoded spreadsheet content (expensive; last resort)
         sheet_name: Name of the specific sheet to read (if None, reads first sheet)
         max_rows: Maximum number of rows to read (default 100)
+        doc_id: Handle from a previous tool or from POST /files (preferred)
+        document_url: http(s)/WebDAV URL the server fetches itself
+        url_auth: "user:password" for document_url, if it needs authentication
     """
     try:
-        with _resolve_document(path, document_base64, format_hint="spreadsheet") as resolved_path:
+        with _resolve_document(path, document_base64, format_hint="spreadsheet", doc_id=doc_id, document_url=document_url, url_auth=url_auth) as resolved_path:
             path_obj = Path(resolved_path)
             
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -590,20 +792,37 @@ def insert_text_at_position(
     position: str = "end",
     document_base64: Optional[str] = None,
     return_base64: bool = False,
+    doc_id: Optional[str] = None,
+    document_url: Optional[str] = None,
+    target_url: Optional[str] = None,
+    url_auth: Optional[str] = None,
 ) -> DocResult:
     """Insert text into a LibreOffice Writer document
-    
+
+    Editing by `path` modifies that file on the server in place. Every other
+    source leaves the original untouched and returns a NEW doc_id for the result.
+
     Args:
-        path: Path to the document file (omit if using document_base64)
+        path: Path on the SERVER's filesystem (edited in place)
         text: Text to insert
         position: Where to insert the text ("start", "end", or "replace")
-        document_base64: Base64-encoded document content (alternative to path)
-        return_base64: If True, return the modified document as base64
+        document_base64: Base64-encoded document content (expensive; last resort)
+        return_base64: Return the modified document inline as base64 (expensive)
+        doc_id: Source handle from a previous tool or from POST /files (preferred)
+        document_url: http(s)/WebDAV URL of the source; the server fetches it
+        target_url: Upload the result to this URL with PUT (WebDAV/Nextcloud)
+        url_auth: "user:password" for document_url/target_url, if needed
     """
-    use_base64 = return_base64 or (document_base64 is not None and not path)
-    
+    # Only an explicit server path is edited in place; anything else is a copy
+    # that has to be handed back somehow.
+    edit_in_place = bool(path) and doc_id is None and document_url is None and document_base64 is None
+    edit_in_place = edit_in_place and not (return_base64 or target_url)
+
     try:
-        with _resolve_document(path, document_base64) as resolved_path:
+        with _resolve_document(
+            path, document_base64, doc_id=doc_id, document_url=document_url,
+            url_auth=url_auth, for_writing=True,
+        ) as resolved_path:
             path_obj = Path(resolved_path)
             existing_content = read_document_text(path=resolved_path).content
             
@@ -618,7 +837,6 @@ def insert_text_at_position(
             
             file_ext = path_obj.suffix.lower()
             
-            import shutil
             backup_path = str(path_obj) + '.backup'
             shutil.copy2(path_obj, backup_path)
             
@@ -636,9 +854,19 @@ def insert_text_at_position(
                 Path(backup_path).unlink(missing_ok=True)
             
             doc_info = _get_document_info(str(path_obj))
-            if use_base64:
-                return DocResult(**doc_info.model_dump(), success=True, result_base64=_read_as_base64(str(path_obj)))
-            return DocResult(**doc_info.model_dump(), success=True)
+            if edit_in_place:
+                return DocResult(**doc_info.model_dump(), success=True)
+
+            delivery = _deliver_result(
+                path_obj,
+                target_url=target_url,
+                return_base64=return_base64,
+                url_auth=url_auth,
+                filename=path_obj.name,
+            )
+            fields = doc_info.model_dump()
+            fields.pop("path", None)  # scratch copy; about to be cleaned up
+            return DocResult(**fields, success=True, **delivery)
     except Exception as e:
         return DocResult(success=False, error=str(e))
 
@@ -795,38 +1023,75 @@ def _recreate_document_with_content(path: str, content: str):
 
 @mcp.tool()
 def insert_tracked_text(
-    document_base64: str,
     anchor_text: str,
     new_text: str,
+    document_base64: Optional[str] = None,
     author: Optional[str] = None,
     insert_mode: str = "after",
+    path: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    document_url: Optional[str] = None,
+    target_url: Optional[str] = None,
+    return_base64: bool = False,
+    url_auth: Optional[str] = None,
 ) -> TrackedInsertResult:
-    """Insert text into an .odt document as a tracked change (tracked change)
-
-    Stateless: takes the source .odt as a base64 blob and returns the modified
-    .odt as a base64 blob — it never touches the caller's filesystem or any
-    remote storage. The caller reads the source file, passes
-    its bytes here, and writes the returned bytes back wherever they came from.
+    """Insert text into an .odt document as a tracked change
 
     Unlike insert_text_at_position, this does NOT rewrite the document content.
     It opens the document via LibreOffice's UNO API, enables RecordChanges,
     finds anchor_text, and inserts new_text next to it so it shows up as a
     reviewable insertion (Edit > Track Changes > Manage).
 
+    The source is never modified unless you pass `path`; by default you get a
+    new doc_id back.
+
     Args:
-        document_base64: Base64-encoded content of the source .odt file
         anchor_text: Existing text used to locate the insertion point
         new_text: Text to insert as a tracked insertion
+        document_base64: Base64-encoded source .odt (expensive; last resort)
         author: "First Last" to attribute the change to (optional)
         insert_mode: "after" (default) or "before" the anchor text
+        path: Path on the SERVER's filesystem (edited in place)
+        doc_id: Source handle from a previous tool or from POST /files (preferred)
+        document_url: http(s)/WebDAV URL of the source; the server fetches it
+        target_url: Upload the result to this URL with PUT (WebDAV/Nextcloud)
+        return_base64: Return the modified document inline as base64 (expensive)
+        url_auth: "user:password" for document_url/target_url, if needed
     """
-    return insert_tracked_text_impl(
-        document_base64=document_base64,
-        anchor_text=anchor_text,
-        new_text=new_text,
-        author=author,
-        insert_mode=insert_mode,
+    edit_in_place = (
+        bool(path)
+        and doc_id is None
+        and document_url is None
+        and document_base64 is None
+        and not (return_base64 or target_url)
     )
+
+    try:
+        with _resolve_document(
+            path, document_base64, doc_id=doc_id, document_url=document_url,
+            url_auth=url_auth, for_writing=True,
+        ) as resolved_path:
+            doc_path = Path(resolved_path)
+            error = insert_tracked_text_in_file(doc_path, anchor_text, new_text, author, insert_mode)
+            if error:
+                return TrackedInsertResult(success=False, error=error)
+
+            if edit_in_place:
+                return TrackedInsertResult(success=True)
+
+            delivery = _deliver_result(
+                doc_path,
+                target_url=target_url,
+                return_base64=return_base64,
+                url_auth=url_auth,
+                filename=doc_path.name,
+            )
+            result = TrackedInsertResult(success=True, **delivery)
+            # Old field name kept in sync so existing callers don't break.
+            result.document_base64 = result.result_base64
+            return result
+    except Exception as e:
+        return TrackedInsertResult(success=False, error=str(e))
 
 
 # Resources for document discovery
@@ -877,33 +1142,55 @@ def get_document_content(path: str) -> str:
 # Additional utility tools
 
 @mcp.tool()
-def search_documents(query: str, search_path: Optional[str] = None, documents_base64: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def search_documents(
+    query: str,
+    search_path: Optional[str] = None,
+    documents_base64: Optional[List[str]] = None,
+    doc_ids: Optional[List[str]] = None,
+    document_urls: Optional[List[str]] = None,
+    url_auth: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Search for documents containing specific text
-    
+
     Args:
         query: Text to search for
-        search_path: Directory to search in (default: common document locations)
-        documents_base64: List of base64-encoded documents to search (alternative to filesystem search)
+        search_path: Directory on the SERVER to search in (default: common locations)
+        documents_base64: Base64-encoded documents to search (expensive; last resort)
+        doc_ids: Handles to search (preferred for documents you uploaded)
+        document_urls: http(s)/WebDAV URLs the server fetches and searches
+        url_auth: "user:password" for document_urls, if needed
     """
     results = []
-    
-    if documents_base64:
-        for idx, doc_b64 in enumerate(documents_base64):
+
+    # Explicit document lists take precedence over walking the server's disk.
+    explicit = (
+        [("doc_id", d) for d in (doc_ids or [])]
+        + [("url", u) for u in (document_urls or [])]
+        + [("base64", b) for b in (documents_base64 or [])]
+    )
+    if explicit:
+        for idx, (kind, value) in enumerate(explicit):
+            label = {"doc_id": f"(doc_id:{value})", "url": value, "base64": f"(base64:{idx})"}[kind]
+            kwargs = {
+                "doc_id": value if kind == "doc_id" else None,
+                "document_url": value if kind == "url" else None,
+                "document_base64": value if kind == "base64" else None,
+            }
             try:
-                with _resolve_document(document_base64=doc_b64) as resolved_path:
+                with _resolve_document(url_auth=url_auth, **kwargs) as resolved_path:
                     content = read_document_text(path=resolved_path)
                     if query.lower() in content.content.lower():
                         results.append({
-                            "path": f"(base64:{idx})",
-                            "filename": f"document_{idx}.odt",
-                            "format": ".odt",
+                            "path": label,
+                            "filename": Path(resolved_path).name,
+                            "format": Path(resolved_path).suffix,
                             "word_count": content.word_count,
                             "match_context": _get_match_context(content.content, query)
                         })
             except Exception:
                 continue
         return results
-    
+
     if search_path:
         search_paths = [Path(search_path)]
     else:
@@ -1002,53 +1289,84 @@ def merge_text_documents(
     separator: str = "\n\n---\n\n",
     documents_base64: Optional[List[str]] = None,
     return_base64: bool = False,
+    doc_ids: Optional[List[str]] = None,
+    document_urls: Optional[List[str]] = None,
+    target_url: Optional[str] = None,
+    url_auth: Optional[str] = None,
 ) -> DocResult:
     """Merge multiple text documents into a single document
-    
+
+    Sources are merged in this order: doc_ids, then document_urls, then
+    documents_base64, then document_paths. Without output_path or target_url the
+    merged document stays on the server and you get a doc_id back.
+
     Args:
-        document_paths: List of paths to documents to merge (omit if using documents_base64)
-        output_path: Path where merged document should be saved (omit for base64 output)
+        document_paths: Paths on the SERVER's filesystem
+        output_path: Write the merged document to this path on the SERVER
         separator: Text to insert between merged documents
-        documents_base64: List of base64-encoded documents to merge (alternative to document_paths)
-        return_base64: If True, return the merged document as base64
+        documents_base64: Base64-encoded documents to merge (expensive; last resort)
+        return_base64: Return the merged document inline as base64 (expensive)
+        doc_ids: Handles of documents to merge (preferred)
+        document_urls: http(s)/WebDAV URLs the server fetches and merges
+        target_url: Upload the merged document to this URL with PUT
+        url_auth: "user:password" for document_urls/target_url, if needed
     """
-    use_base64 = return_base64 or (documents_base64 is not None and not output_path)
     merged_content = []
-    
-    if documents_base64:
-        for idx, doc_b64 in enumerate(documents_base64):
-            try:
-                with _resolve_document(document_base64=doc_b64) as resolved_path:
-                    content = read_document_text(path=resolved_path)
-                    merged_content.append(f"=== document_{idx}.odt ===\n\n{content.content}")
-            except Exception as e:
-                merged_content.append(f"=== document_{idx}.odt ===\n\nError reading document: {str(e)}")
-    else:
-        paths = document_paths or []
-        for doc_path in paths:
-            try:
-                content = read_document_text(doc_path)
-                doc_name = Path(doc_path).name
-                merged_content.append(f"=== {doc_name} ===\n\n{content.content}")
-            except Exception as e:
-                merged_content.append(f"=== {Path(doc_path).name} ===\n\nError reading document: {str(e)}")
-    
+
+    sources = (
+        [("doc_id", d) for d in (doc_ids or [])]
+        + [("url", u) for u in (document_urls or [])]
+        + [("base64", b) for b in (documents_base64 or [])]
+        + [("path", p) for p in (document_paths or [])]
+    )
+
+    for idx, (kind, value) in enumerate(sources):
+        kwargs = {
+            "doc_id": value if kind == "doc_id" else None,
+            "document_url": value if kind == "url" else None,
+            "document_base64": value if kind == "base64" else None,
+            "path": value if kind == "path" else None,
+        }
+        label = value if kind in ("path", "url") else f"document_{idx}"
+        try:
+            with _resolve_document(url_auth=url_auth, **kwargs) as resolved_path:
+                label = Path(resolved_path).name if kind != "url" else value
+                content = read_document_text(path=resolved_path)
+                merged_content.append(f"=== {label} ===\n\n{content.content}")
+        except Exception as e:
+            merged_content.append(f"=== {label} ===\n\nError reading document: {str(e)}")
+
     final_content = separator.join(merged_content)
-    
-    if use_base64:
-        return create_document(doc_type="writer", content=final_content, return_base64=True)
-    return create_document(path=output_path or "merged.odt", doc_type="writer", content=final_content)
+
+    if output_path:
+        return create_document(path=output_path, doc_type="writer", content=final_content)
+    return create_document(
+        doc_type="writer",
+        content=final_content,
+        return_base64=return_base64,
+        target_url=target_url,
+        url_auth=url_auth,
+    )
 
 
 @mcp.tool()
-def get_document_statistics(path: Optional[str] = None, document_base64: Optional[str] = None) -> Dict[str, Any]:
+def get_document_statistics(
+    path: Optional[str] = None,
+    document_base64: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    document_url: Optional[str] = None,
+    url_auth: Optional[str] = None,
+) -> Dict[str, Any]:
     """Get detailed statistics about a document
-    
+
     Args:
-        path: Path to the document file (omit if using document_base64)
-        document_base64: Base64-encoded document content (alternative to path)
+        path: Path on the SERVER's filesystem
+        document_base64: Base64-encoded document content (expensive; last resort)
+        doc_id: Handle from a previous tool or from POST /files (preferred)
+        document_url: http(s)/WebDAV URL the server fetches itself
+        url_auth: "user:password" for document_url, if it needs authentication
     """
-    with _resolve_document(path, document_base64) as resolved_path:
+    with _resolve_document(path, document_base64, doc_id=doc_id, document_url=document_url, url_auth=url_auth) as resolved_path:
         doc_info = get_document_info(path=resolved_path)
         
         try:
@@ -1094,6 +1412,17 @@ def get_server_info() -> Dict[str, Any]:
         "transport_mode": _TRANSPORT,
         "temp_directory": tempfile.gettempdir(),
         "libreoffice_version": None,
+        "transfer": {
+            "preferred": "doc_id",
+            "upload_endpoint": f"{docstore.public_base_url() or '<server-base-url>'}/files",
+            "download_endpoint": f"{docstore.public_base_url() or '<server-base-url>'}/files/{{doc_id}}",
+            "public_url_configured": docstore.public_base_url() is not None,
+            "auth_required": http_routes.auth_required(),
+            "url_fetch_enabled": True,
+            "allowed_url_hosts": urlio.allowed_hosts() or "any public host (loopback/link-local blocked)",
+            "doc_ttl_seconds": docstore.ttl_seconds(),
+            "max_doc_mb": docstore.max_doc_bytes() / (1024 * 1024),
+        },
         "hints": [],
     }
 
@@ -1107,29 +1436,101 @@ def get_server_info() -> Dict[str, Any]:
     except Exception:
         pass
 
-    server_is_linux = info["platform"] == "Linux"
-    if server_is_linux:
-        info["hints"].append(
-            "Server runs on Linux. Windows paths (C:\\...) are NOT accessible "
-            "from this server. Always use 'document_base64' parameter to send "
-            "document content when the file is on your local Windows machine."
-        )
-
-    if info["in_docker"]:
-        info["hints"].append(
-            "Server runs inside a Docker container. The container filesystem "
-            "is isolated from the host. Read documents locally and pass them "
-            "via 'document_base64'."
-        )
-
+    base = docstore.public_base_url() or "<server-base-url>"
     info["hints"].append(
-        "All tools support 'document_base64' as an alternative to filesystem "
-        "paths. When you get 'Document not found' errors, switch to "
-        "document_base64 mode: read the file locally → encode to base64 → "
-        "pass as document_base64=<encoded>."
+        f"Preferred workflow: upload the file once with "
+        f"`curl --data-binary @file.odt '{base}/files?filename=file.odt'`, then pass the "
+        f"returned doc_id to the tools. Each tool returns a new doc_id, so you can chain "
+        f"them without any document bytes entering the conversation."
+    )
+    info["hints"].append(
+        "Second best: 'document_url' — give the server an http(s)/WebDAV URL and it fetches "
+        "the document itself. 'target_url' does the same in reverse (PUT)."
+    )
+    info["hints"].append(
+        "'document_base64' still works but costs ~1.33 bytes of context per document byte, "
+        "on every call. Use it only when the client cannot make an HTTP request itself."
     )
 
+    if info["platform"] == "Linux" or info["in_docker"]:
+        info["hints"].append(
+            "This server does not share a filesystem with you: Windows paths (C:\\...) and "
+            "your local paths are NOT accessible. Use doc_id or document_url instead of 'path'."
+        )
+
+    if not info["transfer"]["public_url_configured"]:
+        info["hints"].append(
+            "MCP_PUBLIC_URL is not set, so download_url fields will be null. Set it to the "
+            "URL clients reach this server on (e.g. http://nas:8765) to get working links."
+        )
+
+    if _TRANSPORT != "stdio" and not info["transfer"]["auth_required"]:
+        info["hints"].append(
+            "⚠ MCP_UPLOAD_TOKEN is not set: anyone who can reach /files can upload and "
+            "download documents. Set it before exposing this server beyond a trusted LAN."
+        )
+
     return info
+
+
+@mcp.tool()
+def fetch_document(document_url: str, url_auth: Optional[str] = None) -> DocResult:
+    """Fetch a document from a URL into server-side storage and return its doc_id
+
+    Use this to bring a document onto the server once (from Nextcloud/WebDAV or
+    any http(s) URL) and then work on it by handle.
+
+    Args:
+        document_url: http(s)/WebDAV URL of the document
+        url_auth: "user:password" if the URL needs authentication
+    """
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            name = urlio.filename_from_url(document_url)
+            dest = Path(tmp_dir) / name
+            urlio.fetch(document_url, dest, url_auth=url_auth)
+            handle = docstore.store_file(dest, name)
+        return DocResult(
+            success=True,
+            filename=handle.filename,
+            format=Path(handle.filename).suffix.lstrip('.'),
+            size_bytes=handle.size_bytes,
+            modified_time=handle.created_at,
+            exists=True,
+            doc_id=handle.doc_id,
+            download_url=docstore.download_url(handle.doc_id),
+        )
+    except Exception as e:
+        return DocResult(success=False, error=str(e))
+
+
+@mcp.tool()
+def delete_document(doc_id: str) -> Dict[str, Any]:
+    """Drop a stored document handle before its TTL expires
+
+    Args:
+        doc_id: The handle to delete
+    """
+    try:
+        deleted = docstore.delete(doc_id)
+        return {"deleted": deleted, "doc_id": doc_id}
+    except docstore.DocStoreError as e:
+        return {"deleted": False, "doc_id": doc_id, "error": str(e)}
+
+
+@mcp.tool()
+def list_stored_documents() -> List[Dict[str, Any]]:
+    """List the documents currently held in server-side storage"""
+    return [
+        {
+            "doc_id": h.doc_id,
+            "filename": h.filename,
+            "size_bytes": h.size_bytes,
+            "created_at": h.created_at.isoformat(),
+            "download_url": docstore.download_url(h.doc_id),
+        }
+        for h in docstore.list_handles()
+    ]
 
 
 # Main server entry point
